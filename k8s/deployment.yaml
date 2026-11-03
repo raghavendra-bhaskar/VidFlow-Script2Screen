@@ -138,7 +138,7 @@ spec:
             - name: data
               mountPath: /app/merged_videos
               subPath: merged_videos
-            - name: video+narrated
+            - name: video-narrated
               mountPath: /app/video+narrated
               subPath: video+narrated
             - name: data
@@ -151,21 +151,21 @@ spec:
             httpGet:
               path: /_stcore/health
               port: 8501
-              scheme: HTTP
-            initialDelaySeconds: 30
+              scheme: HTTPS
+            initialDelaySeconds: 45
             periodSeconds: 15
           readinessProbe:
             httpGet:
               path: /_stcore/health
               port: 8501
-              scheme: HTTP
-            initialDelaySeconds: 10
-            periodSeconds: 5
+              scheme: HTTPS
+            initialDelaySeconds: 20
+            periodSeconds: 10
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: vidflow-data
-        - name: video+narrated
+        - name: video-narrated
           persistentVolumeClaim:
             claimName: vidflow-data
 
@@ -178,14 +178,16 @@ metadata:
 spec:
   selector:
     app: vidflow
+  type: NodePort
   ports:
     - name: streamlit
       port: 8501
       targetPort: 8501
+      nodePort: 30501
     - name: api
       port: 8502
       targetPort: 8502
-  type: ClusterIP
+      nodePort: 30502
 
 ---
 # cert-manager ClusterIssuer — creates a Let's Encrypt HTTPS cert automatically.

@@ -11,6 +11,8 @@ build_tts_audio_config() : Build a Google Cloud TTS AudioConfig object.
 create_tts()     : Synthesise speech with Google Cloud TTS → MP3 file.
 create_tts_offline() : Synthesise speech with pyttsx3 (no API key) → MP3 file.
 list_offline_voices() : Return available pyttsx3 system voices as (name, id) pairs.
+create_tts_edge()    : Synthesise speech with Microsoft Edge neural TTS (edge-tts, free, internet).
+list_edge_voices()   : Return curated list of edge-tts neural voice names.
 write_srt()      : Write a sentence-timed .srt subtitle file.
 build_final_ffmpeg_command() : Assemble the FFmpeg merge + subtitle command.
 """
@@ -250,6 +252,82 @@ def create_tts_offline(text, path, speaking_rate=1.0, voice_id=None):
         text=True,
     )
     tmp_wav.unlink(missing_ok=True)
+
+
+# Curated selection of high-quality Microsoft Edge neural voices.
+# Keys are human-readable display names shown in the sidebar dropdown.
+# Values are the edge-tts voice identifiers passed to edge_tts.Communicate().
+EDGE_TTS_VOICES = {
+    "Jenny (US, female)": "en-US-JennyNeural",
+    "Guy (US, male)": "en-US-GuyNeural",
+    "Aria (US, female)": "en-US-AriaNeural",
+    "Davis (US, male)": "en-US-DavisNeural",
+    "Neerja (India, female)": "en-IN-NeerjaNeural",
+    "Prabhat (India, male)": "en-IN-PrabhatNeural",
+    "Sonia (UK, female)": "en-GB-SoniaNeural",
+    "Ryan (UK, male)": "en-GB-RyanNeural",
+    "Natasha (AU, female)": "en-AU-NatashaNeural",
+    "William (AU, male)": "en-AU-WilliamNeural",
+}
+
+
+def list_edge_voices():
+    """Return the curated edge-tts voice list as (display_name, voice_id) tuples.
+
+    Does NOT require edge-tts to be imported — returns the static list directly.
+    """
+    return list(EDGE_TTS_VOICES.items())
+
+
+def create_tts_edge(text, path, voice="en-US-JennyNeural", speaking_rate=1.0):
+    """Synthesise speech using Microsoft Edge's online neural TTS (edge-tts package).
+
+    Produces natural, human-quality audio comparable to Azure Neural TTS.
+    Free to use with no API key; requires an internet connection.
+
+    Parameters
+    ----------
+    text : str
+        The narration text to synthesise.
+    path : pathlib.Path | str
+        Destination MP3 file path.  edge-tts writes MP3 directly; no conversion needed.
+    voice : str
+        Edge TTS voice identifier, e.g. "en-US-JennyNeural".  See EDGE_TTS_VOICES.
+    speaking_rate : float
+        Speed multiplier relative to normal (1.0).  Converts to edge-tts rate strings
+        such as "+10%" (faster) or "-10%" (slower).
+    """
+    import threading
+    import edge_tts
+
+    # edge-tts uses percentage strings: +10% = 10% faster, -10% = 10% slower
+    pct = int((speaking_rate - 1.0) * 100)
+    rate_str = f"+{pct}%" if pct >= 0 else f"{pct}%"
+
+    async def _synthesise():
+        communicate = edge_tts.Communicate(text, voice, rate=rate_str)
+        await communicate.save(str(path))
+
+    # Run synthesis in a fresh OS thread with its own event loop so we never
+    # collide with Streamlit's internal asyncio event loop running in the main thread.
+    exc_bucket: list[BaseException] = []
+
+    def _run_loop():
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(_synthesise())
+        except Exception as exc:
+            exc_bucket.append(exc)
+        finally:
+            loop.close()
+
+    worker = threading.Thread(target=_run_loop, daemon=True)
+    worker.start()
+    worker.join(timeout=120)
+    if exc_bucket:
+        raise exc_bucket[0]
 
 
 def build_subtitle_filter(srt_path):

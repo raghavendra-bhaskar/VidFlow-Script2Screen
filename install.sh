@@ -79,14 +79,26 @@ if [[ "$DEPLOY_CHOICE" == "1" ]]; then
     fi
     echo "INFO: Using $PYTHON ($($PYTHON --version))"
 
+    # ── 2b. Install espeak-ng (pyttsx3 offline TTS fallback on Linux) ──────
+    if [[ "$OSTYPE" != "darwin"* ]]; then
+        echo "INFO: Installing espeak-ng for offline TTS fallback..."
+        if command -v apt-get &>/dev/null; then
+            sudo apt-get install -y espeak-ng 2>/dev/null || echo "WARN: espeak-ng install failed — offline pyttsx3 TTS will not work, but edge-tts neural TTS will."
+        elif command -v dnf &>/dev/null; then
+            sudo dnf install -y espeak-ng 2>/dev/null || true
+        fi
+    fi
+
     # ── 3. Python virtual environment + dependencies ──────────────
     echo ""
     echo "[3/5] Creating Python virtual environment (.venv)..."
     [[ -d ".venv" ]] && echo "INFO: .venv already exists — skipping." || $PYTHON -m venv .venv
-    source .venv/bin/activate
-    pip install --upgrade pip --quiet
-    echo "INFO: Installing Python dependencies..."
-    pip install -r requirements.txt
+    # Use 'python -m pip' explicitly to ensure we always install into THIS venv's
+    # site-packages regardless of any system pip that may be in PATH.
+    echo "INFO: Upgrading pip..."
+    .venv/bin/python -m pip install --upgrade pip --quiet
+    echo "INFO: Installing Python dependencies (includes edge-tts for neural voice)..."
+    .venv/bin/python -m pip install -r requirements.txt
 
     # ── 4. .env template ──────────────────────────────────────────
     echo ""
@@ -125,14 +137,22 @@ if [[ "$DEPLOY_CHOICE" == "1" ]]; then
     echo "============================================================"
     echo ""
     echo " Start the app:"
-    echo "   chmod +x start_app.sh stop_app.sh"
+    echo "   chmod +x start_app.sh stop_app.sh uninstall.sh"
     echo "   ./start_app.sh"
     echo ""
     echo " Stop the app:"
     echo "   ./stop_app.sh"
     echo ""
+    echo " Uninstall:"
+    echo "   ./uninstall.sh"
+    echo ""
     echo " Open: https://${CERT_DOMAIN}:8501"
     echo " (Accept the self-signed certificate warning on first visit.)"
+    echo ""
+    echo " Narration engines available (choose in sidebar):"
+    echo "   - Neural (edge-tts)  — Microsoft neural voices, free, internet required (DEFAULT on Linux)"
+    echo "   - System (pyttsx3)   — offline espeak-ng voices"
+    echo "   - Google Cloud TTS   — Indian English neural voices (needs GOOGLE_APPLICATION_CREDENTIALS)"
     echo ""
     echo " For a public domain with Let's Encrypt TLS:"
     echo "   1. Set NO_SSL=1 in .env"

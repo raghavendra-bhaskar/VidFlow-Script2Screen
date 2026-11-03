@@ -84,7 +84,7 @@ warnings.filterwarnings("ignore", message=r".*st\.iframe.*")
 from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont
-from video_core import FFMPEG, FFPROBE, build_final_ffmpeg_command, create_tts, create_tts_offline, list_offline_voices, sentences, write_srt
+from video_core import FFMPEG, FFPROBE, build_final_ffmpeg_command, create_tts, create_tts_edge, create_tts_offline, list_edge_voices, list_offline_voices, sentences, write_srt
 
 load_dotenv()
 st.set_page_config(page_title="Text to Video AI", page_icon="🎬", layout="wide")
@@ -104,24 +104,45 @@ with st.sidebar:
         "Animated explainer",
         "Talking AI presenter (provider integration)"
     ])
-    # Pitch and cloud voice selection are only meaningful when Google Cloud TTS is available
+    # ── TTS engine selection ──────────────────────────────────────────────
     cloud_tts_available = bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
+    # On Linux pyttsx3 uses espeak-ng which sounds robotic; default to Neural.
+    _is_linux = sys.platform.startswith("linux")
+    _tts_engines = []
     if cloud_tts_available:
+        _tts_engines.append("Google Cloud TTS")
+    _tts_engines.append("Neural (edge-tts)")
+    _tts_engines.append("System voice (pyttsx3)")
+    _default_engine = "Neural (edge-tts)" if _is_linux and not cloud_tts_available else _tts_engines[0]
+    tts_engine = st.selectbox("Narration engine", _tts_engines,
+                              index=_tts_engines.index(_default_engine))
+
+    if tts_engine == "Google Cloud TTS":
         voice = st.selectbox("Narration voice", [
             "en-IN-Neural2-B", "en-IN-Neural2-A", "en-IN-Neural2-C",
             "en-IN-Neural2-D", "en-IN-Standard-B", "en-IN-Standard-A"
         ], index=0)
         _offline_voice_id = None
+        _edge_voice_id = None
         pitch = st.slider("Voice pitch", min_value=-6.0, max_value=6.0, value=0.0, step=0.5)
+    elif tts_engine == "Neural (edge-tts)":
+        _ev = list_edge_voices()
+        _ev_labels = [v[0] for v in _ev]
+        _ev_sel = st.selectbox("Narration voice", _ev_labels)
+        voice = _ev_sel
+        _edge_voice_id = next((v[1] for v in _ev if v[0] == _ev_sel), "en-US-JennyNeural")
+        _offline_voice_id = None
+        pitch = 0.0
+        st.info("Neural TTS via Microsoft Edge — natural quality, no API key. Requires internet.")
     else:
-        # Show local pyttsx3 system voices so the user can switch between them
         _sys_voices = list_offline_voices()
         _sv_labels = [v[0] for v in _sys_voices]
         _sv_sel = st.selectbox("Narration voice (system)", _sv_labels)
-        voice = _sv_sel  # used only as a display label in cloud path
+        voice = _sv_sel
         _offline_voice_id = next((v[1] for v in _sys_voices if v[0] == _sv_sel), None)
+        _edge_voice_id = None
         pitch = 0.0
-        st.info("Offline TTS (system voice) will be used — no API key needed. Set GOOGLE_APPLICATION_CREDENTIALS for cloud voices and pitch control.")
+        st.info("Offline TTS (system voice) — no API key needed. Quality depends on OS voices.")
     speaking_rate = st.slider("Voice speed", min_value=0.75, max_value=1.25, value=1.0, step=0.05)
     aspect = st.selectbox("Format", ["16:9 landscape", "9:16 vertical"])
     captions = st.checkbox("Burn subtitles into video", value=True)
@@ -561,11 +582,14 @@ with tab1:
             try:
                 folder = Path(tempfile.mkdtemp(prefix="text_to_video_"))
                 audio = folder / "narration.mp3"
-                if cloud_tts_available:
-                    st.write("1/4 — Generating Indian English narration (Google Cloud TTS)")
+                if tts_engine == "Google Cloud TTS":
+                    st.write("1/4 — Generating narration (Google Cloud TTS)")
                     create_tts(script.strip(), audio, voice, speaking_rate=speaking_rate, pitch=pitch)
+                elif tts_engine == "Neural (edge-tts)":
+                    st.write(f"1/4 — Generating narration (edge-tts: {voice})")
+                    create_tts_edge(script.strip(), audio, voice=_edge_voice_id, speaking_rate=speaking_rate)
                 else:
-                    st.write("1/4 — Generating narration (offline system TTS — pyttsx3)")
+                    st.write("1/4 — Generating narration (system TTS — pyttsx3)")
                     create_tts_offline(script.strip(), audio, speaking_rate=speaking_rate, voice_id=_offline_voice_id)
                 duration = _probe_duration(audio)
                 per_scene = duration / max(1, len(lines))
@@ -966,21 +990,27 @@ with tab2:
                         if end_s is not None:
                             # 2-pass: measure natural duration at 1.0x, then re-generate at adjusted rate
                             tmp = folder / f"seg_{idx:02d}_tmp.mp3"
-                            if cloud_tts_available:
+                            if tts_engine == "Google Cloud TTS":
                                 create_tts(text, tmp, voice, speaking_rate=1.0, pitch=pitch)
+                            elif tts_engine == "Neural (edge-tts)":
+                                create_tts_edge(text, tmp, voice=_edge_voice_id, speaking_rate=1.0)
                             else:
                                 create_tts_offline(text, tmp, speaking_rate=1.0, voice_id=_offline_voice_id)
                             nat_dur = _probe_duration(tmp)
                             target = end_s - start_s
                             adj_rate = max(0.5, min(4.0, nat_dur / target))
-                            if cloud_tts_available:
+                            if tts_engine == "Google Cloud TTS":
                                 create_tts(text, seg_audio, voice, speaking_rate=adj_rate, pitch=pitch)
+                            elif tts_engine == "Neural (edge-tts)":
+                                create_tts_edge(text, seg_audio, voice=_edge_voice_id, speaking_rate=adj_rate)
                             else:
                                 create_tts_offline(text, seg_audio, speaking_rate=adj_rate, voice_id=_offline_voice_id)
                             st.write(f"   Seg {idx+1}: {start_s:.1f}s→{end_s:.1f}s | rate {adj_rate:.2f}x ✓")
                         else:
-                            if cloud_tts_available:
+                            if tts_engine == "Google Cloud TTS":
                                 create_tts(text, seg_audio, voice, speaking_rate=speaking_rate, pitch=pitch)
+                            elif tts_engine == "Neural (edge-tts)":
+                                create_tts_edge(text, seg_audio, voice=_edge_voice_id, speaking_rate=speaking_rate)
                             else:
                                 create_tts_offline(text, seg_audio, speaking_rate=speaking_rate, voice_id=_offline_voice_id)
                             st.write(f"   Seg {idx+1}: start={start_s:.1f}s ✓")
@@ -1833,9 +1863,10 @@ with tab7:
                 try:
                     ae_tts_folder = Path(tempfile.mkdtemp(prefix="ttv_aetts_"))
                     ae_mp3 = ae_tts_folder / "tts_output.mp3"
-                    if cloud_tts_available:
-                        create_tts(ae_text.strip(), ae_mp3, voice,
-                                   speaking_rate=ae_rate, pitch=pitch)
+                    if tts_engine == "Google Cloud TTS":
+                        create_tts(ae_text.strip(), ae_mp3, voice, speaking_rate=ae_rate, pitch=pitch)
+                    elif tts_engine == "Neural (edge-tts)":
+                        create_tts_edge(ae_text.strip(), ae_mp3, voice=_edge_voice_id, speaking_rate=ae_rate)
                     else:
                         create_tts_offline(ae_text.strip(), ae_mp3, speaking_rate=ae_rate, voice_id=_offline_voice_id)
 

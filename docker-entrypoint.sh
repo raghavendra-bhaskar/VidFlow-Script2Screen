@@ -24,7 +24,14 @@ fi
 APP_PORT="${PORT:-8501}"
 echo "[entrypoint] Starting Streamlit on 0.0.0.0:${APP_PORT}..."
 
-exec python -m streamlit run app.py \
-    --server.port "${APP_PORT}" \
-    --server.address "0.0.0.0" \
-    --server.headless true
+# Do NOT use exec here — keeping the shell as PID 1 means we can kill/restart
+# Streamlit (e.g. after a kubectl cp file update) without the container exiting.
+# Kubernetes only restarts the pod when PID 1 exits.
+while true; do
+    python -m streamlit run app.py \
+        --server.port "${APP_PORT}" \
+        --server.address "0.0.0.0" \
+        --server.headless true || true
+    echo "[entrypoint] Streamlit stopped — restarting in 3 s…"
+    sleep 3
+done

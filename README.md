@@ -33,8 +33,9 @@
 
 | Feature | Offline | Details |
 |---|---|---|
-| **System TTS voice selection** | ✅ | All installed Windows/macOS/Linux voices listed in sidebar dropdown |
-| **Google Cloud TTS** | ❌ | Indian English neural voices with pitch and speed control |
+| **Neural TTS (edge-tts)** | ❌* | Microsoft Edge neural voices — natural quality, free, no API key; internet required. Default on Linux/VM. |
+| **System TTS (pyttsx3)** | ✅ | All installed Windows SAPI5 / Linux espeak-ng voices listed in sidebar dropdown |
+| **Google Cloud TTS** | ❌ | Indian English Neural2/Standard voices with pitch and speed control |
 | **Animated explainer** | ✅ | Pillow-generated title cards + FFmpeg zoom — zero API calls |
 | **AI-generated scenes** | ❌ | Gemini generates one image per sentence |
 | **Stock footage** | ❌ | Pexels search + trim/resize per sentence |
@@ -118,9 +119,18 @@ source .venv/bin/activate
 ```
 
 ### 3. Install Python dependencies
+
+Always use `python -m pip` to install into the correct venv interpreter:
+
 ```bash
-pip install -r requirements.txt
+# Linux / macOS
+.venv/bin/python -m pip install -r requirements.txt
+
+# Windows
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+> **Why `python -m pip` not just `pip`?** On some systems (particularly Windows Store Python), `pip` in the terminal may point to a different Python interpreter than the venv's `python.exe`. Using `python -m pip` always installs into the venv you're targeting.
 
 ### 4. Configure environment
 ```bash
@@ -194,13 +204,19 @@ Converts a plain-text script into a fully rendered MP4 with narration, scenes, a
    - **Animated explainer** — fully offline, no keys required
    - **AI-generated scenes** — requires `GOOGLE_API_KEY`
    - **Stock footage** — requires `PEXELS_API_KEY`
-2. Select **Narration voice**:
-   - **Offline mode**: dropdown lists all installed system voices (Microsoft David, Zira, Hazel, etc.)
-   - **Cloud mode** (`GOOGLE_APPLICATION_CREDENTIALS` set): Indian English Neural2 / Standard voices + **Voice pitch** slider
-3. Adjust **Voice speed** (0.75× – 1.25×).
-4. Paste your script (up to 20 sentences).
-5. Click **Generate video**.
-6. Download the MP4 or narration MP3.
+2. Select **Narration engine** in the sidebar:
+
+   | Engine | Quality | Notes |
+   |---|---|---|
+   | **Neural (edge-tts)** | ⭐⭐⭐⭐⭐ | Microsoft Edge neural voices — natural, human-quality. **Default on Linux/VM.** Requires internet. |
+   | **System voice (pyttsx3)** | ⭐⭐ | Offline system voices. Excellent on Windows (SAPI5); robotic on Linux (espeak-ng). |
+   | **Google Cloud TTS** | ⭐⭐⭐⭐⭐ | Indian English Neural2 voices + **Voice pitch** slider. Requires `GOOGLE_APPLICATION_CREDENTIALS`. |
+
+3. Select **Narration voice** from the dropdown (voices change based on engine).
+4. Adjust **Voice speed** (0.75× – 1.25×).
+5. Paste your script (up to 20 sentences).
+6. Click **Generate video**.
+7. Download the MP4 or narration MP3.
 
 ---
 
@@ -371,6 +387,84 @@ Set them in `.env` (copy from `.env.example`). **Never commit `.env` to source c
 
 ---
 
+## Kubernetes deployment (VM / production)
+
+For the `hclswl2learninghub` VM running k3s:
+
+### One-time setup
+
+```bash
+# 1. Run the install script and choose option 2 (Kubernetes)
+chmod +x install.sh uninstall.sh
+./install.sh
+# Choose: 2 (Kubernetes)
+# Image name: localhost/vidflow:latest
+# Hostname: hclswl2learninghub
+```
+
+### Manual build + deploy
+
+```bash
+# Transfer source files from Windows to VM
+# (run on Windows PowerShell)
+scp -r "D:\AI\VidFlow-Script2Screen" hcluser@10.115.54.50:~/VidFlow-Script2Screen
+
+# On the VM
+cd ~/VidFlow-Script2Screen
+podman build -t localhost/vidflow:latest .
+podman save localhost/vidflow:latest | sudo k3s ctr images import -
+kubectl rollout restart deploy/vidflow -n vidflow
+kubectl -n vidflow rollout status deploy/vidflow
+```
+
+### Quick in-pod file update (no rebuild needed)
+
+Use this when only `app.py` / `video_core.py` changed, to avoid a full image rebuild.
+Edge-tts must already be installed in the pod from a previous session.
+
+```bash
+# From Windows — copy files to VM first
+scp "D:\AI\VidFlow-Script2Screen\app.py" hcluser@10.115.54.50:~/
+scp "D:\AI\VidFlow-Script2Screen\video_core.py" hcluser@10.115.54.50:~/
+
+# On VM — copy into running pod
+POD=$(kubectl get pods -n vidflow -l app=vidflow -o jsonpath='{.items[0].metadata.name}')
+kubectl cp ~/app.py vidflow/$POD:/app/app.py
+kubectl cp ~/video_core.py vidflow/$POD:/app/video_core.py
+# Streamlit auto-reloads within ~5 seconds (file watcher)
+
+# Install edge-tts if not already in the pod
+kubectl exec -n vidflow $POD -- pip install "edge-tts>=6.1.9"
+```
+
+### Access URLs
+
+| URL | Description |
+|---|---|
+| `https://hclswl2learninghub:30501` | VidFlow Streamlit UI (NodePort) |
+| `https://hclswl2learninghub:30502` | Internal API server |
+
+### HCL Learning Hub integration
+
+In the admin panel → Settings → Integrations → VidFlow:
+- **VidFlow Server URL**: `https://hclswl2learninghub:30501`
+- Click **Check Status** — the Learning Hub server probes `/_stcore/health` on the VidFlow pod using `https.request` with `rejectUnauthorized: false` (self-signed cert accepted).
+
+---
+
+## Uninstalling
+
+```bash
+chmod +x uninstall.sh
+./uninstall.sh
+# Choose:
+#   1 = VM only (stop process, remove .venv, certs, media)
+#   2 = k8s only (delete namespace + imported image)
+#   3 = Both
+```
+
+---
+
 ## Running tests
 
 ```powershell
@@ -393,12 +487,20 @@ $env:RUN_REAL_TTS_TEST="true"
 ```
 VidFlow-Script2Screen/
 ├── app.py                   # Streamlit UI — 7 tabs + sidebar
-├── video_core.py            # Core pipeline: TTS, FFmpeg helpers, SRT, voice list
+├── video_core.py            # Core pipeline: TTS (edge-tts/pyttsx3/GCloud), FFmpeg, SRT
 ├── gen_cert.py              # One-time HTTPS certificate generator (self-signed)
-├── requirements.txt         # Python dependencies
-├── .env.example             # Template for API keys
+├── requirements.txt         # Python dependencies (includes edge-tts>=6.1.9)
+├── .env.example             # Template for API keys + VIDFLOW_DOMAIN
 ├── install.bat              # Windows automated installer (5-step)
 ├── install.sh               # Linux/macOS automated installer (5-step)
+├── uninstall.sh             # Remove VM install and/or k8s resources
+├── start_app.sh / .bat      # Start VidFlow in background (VM mode)
+├── stop_app.sh  / .bat      # Stop background VidFlow process
+├── Dockerfile               # Container image (Python 3.12, ffmpeg, espeak-ng)
+├── docker-entrypoint.sh     # Container startup with restart loop (no exec)
+├── nginx.conf               # Optional: nginx reverse proxy for TLS termination
+├── k8s/
+│   └── deployment.yaml      # Namespace, ConfigMap, PVC, Deployment, Service, Ingress
 ├── .streamlit/
 │   └── config.toml          # Upload size limit + SSL cert paths
 ├── cert.pem                 # TLS certificate (generated by gen_cert.py)
@@ -424,6 +526,7 @@ VidFlow-Script2Screen/
 - **Phase 3** ✅ Video editor (Trim / Merge / A/V Sync)
 - **Phase 4** ✅ Transcript (faster-whisper), Auto-narrate (Gemini + Ollama)
 - **Phase 5** ✅ Audio editor (TTS / Trim / Merge), HTTPS, system voice selection
+- **Phase 5b** ✅ Neural TTS via edge-tts (Microsoft Edge voices), Kubernetes deployment, uninstall script
 - **Phase 6** — Sentence-level word-timestamp alignment
 - **Phase 7** — Talking avatar via provider API
 - **Phase 8** — Job queue, project history, export profiles
