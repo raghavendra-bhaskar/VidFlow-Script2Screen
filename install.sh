@@ -150,25 +150,56 @@ if [[ "$DEPLOY_CHOICE" == "2" ]]; then
 
     # ── Pre-flight checks ─────────────────────────────────────────
     echo "[k8s 1/4] Checking prerequisites..."
-    MISSING=()
-    command -v docker   &>/dev/null || MISSING+=("docker")
-    command -v kubectl  &>/dev/null || MISSING+=("kubectl")
-    if [[ ${#MISSING[@]} -gt 0 ]]; then
-        echo "ERROR: The following tools are required but not installed:"
-        for m in "${MISSING[@]}"; do echo "  - $m"; done
-        echo ""
-        echo "  Docker  : https://docs.docker.com/get-docker/"
-        echo "  kubectl : https://kubernetes.io/docs/tasks/tools/"
+
+    # Detect podman (preferred on RHEL/CentOS/Fedora) or fall back to docker
+    if command -v podman &>/dev/null; then
+        BUILD_CMD="podman"
+        echo "INFO: podman detected — using podman for image build/push."
+    elif command -v docker &>/dev/null; then
+        BUILD_CMD="docker"
+        echo "INFO: docker detected."
+    else
+        echo "ERROR: Neither podman nor docker is installed."
+        echo "       Install podman: https://podman.io/getting-started/installation"
+        echo "       Or docker:      https://docs.docker.com/get-docker/"
         exit 1
     fi
-    echo "INFO: docker OK — $(docker --version)"
-    echo "INFO: kubectl OK — $(kubectl version --client --short 2>/dev/null || kubectl version --client)"
+
+    if ! command -v kubectl &>/dev/null; then
+        echo "ERROR: kubectl is not installed."
+        echo "       https://kubernetes.io/docs/tasks/tools/"
+        exit 1
+    fi
+
+    echo "INFO: ${BUILD_CMD} OK — $(${BUILD_CMD} --version)"
+    echo "INFO: kubectl OK — $(kubectl version --client 2>/dev/null | head -1)"
 
     # ── Collect configuration ─────────────────────────────────────
     echo ""
     echo "[k8s 2/4] Configuration..."
-    read -rp "  Docker image name (e.g. myregistry/vidflow:latest): " IMAGE_NAME
-    IMAGE_NAME="${IMAGE_NAME:-vidflow:latest}"
+    echo ""
+    echo "  Image name rules:"
+    echo "    Docker Hub    : yourusername/vidflow:latest"
+    echo "    Local registry: registry.example.com:5000/vidflow:latest"
+    echo "    Skip push     : just press Enter — image will be imported locally"
+    echo ""
+    read -rp "  Image name [default: localhost/vidflow:latest]: " IMAGE_NAME
+    IMAGE_NAME="${IMAGE_NAME:-localhost/vidflow:latest}"
+
+    # ── Validate: reject bare names that map to docker.io/library/ ───
+    # A bare name like 'vidflow' or 'vidflow:latest' has no '/' and no hostname.
+    # Pushing to docker.io/library/* requires Docker official maintainer access.
+    if [[ "$IMAGE_NAME" != *"/"* ]]; then
+        echo ""
+        echo "ERROR: Image name '$IMAGE_NAME' has no registry or username prefix."
+        echo "       docker.io/library/* requires special Docker Hub access."
+        echo ""
+        echo "  Use one of these formats instead:"
+        echo "    yourdockerhubuser/vidflow:latest"
+        echo "    registry.hclswl2learninghub:5000/vidflow:latest"
+        echo "    localhost/vidflow:latest  (no push, import directly into k8s)"
+        exit 1
+    fi
 
     read -rp "  Public hostname (e.g. hclswl2learninghub): " K8S_DOMAIN
     K8S_DOMAIN="${K8S_DOMAIN:-hclswl2learninghub}"
@@ -176,36 +207,60 @@ if [[ "$DEPLOY_CHOICE" == "2" ]]; then
     read -rp "  Kubernetes namespace [default: vidflow]: " K8S_NS
     K8S_NS="${K8S_NS:-vidflow}"
 
-    read -rp "  Push image to registry? [Y/n]: " DO_PUSH
-    DO_PUSH="${DO_PUSH:-Y}"
-
-    # ── Build Docker image ────────────────────────────────────────
     echo ""
-    echo "[k8s 3/4] Building Docker image: ${IMAGE_NAME}..."
-    docker build -t "${IMAGE_NAME}" .
+    echo "  Registry push options:"
+    echo "    y  = tag & push to a remote registry (Docker Hub, private registry)"
+    echo "    n  = skip push; import image directly into k8s node (no registry needed)"
+    read -rp "  Push image to registry? [y/N]: " DO_PUSH
+    DO_PUSH="${DO_PUSH:-N}"
+
+    # ── Build image ───────────────────────────────────────────────
+    echo ""
+    echo "[k8s 3/4] Building image: ${IMAGE_NAME}..."
+    ${BUILD_CMD} build -t "${IMAGE_NAME}" .
     echo "INFO: Image built successfully."
 
     if [[ "${DO_PUSH,,}" == "y" ]]; then
         echo "INFO: Pushing image to registry..."
-        docker push "${IMAGE_NAME}"
+        ${BUILD_CMD} push "${IMAGE_NAME}"
         echo "INFO: Push complete."
+        PULL_POLICY="Always"
+    else
+        echo "INFO: Skipping registry push — importing image directly into k8s..."
+        # Import into the local container runtime used by the k8s node.
+        # Supports k3s, standard containerd, and microk8s.
+        if command -v k3s &>/dev/null; then
+            echo "INFO: k3s detected — importing via k3s ctr..."
+            ${BUILD_CMD} save "${IMAGE_NAME}" | sudo k3s ctr images import -
+        elif command -v ctr &>/dev/null; then
+            echo "INFO: containerd (ctr) detected — importing via ctr..."
+            ${BUILD_CMD} save "${IMAGE_NAME}" | sudo ctr -n k8s.io images import -
+        elif command -v microk8s &>/dev/null; then
+            echo "INFO: microk8s detected — importing via microk8s ctr..."
+            ${BUILD_CMD} save "${IMAGE_NAME}" | microk8s ctr images import -
+        else
+            echo "WARN: Could not detect k3s/ctr/microk8s."
+            echo "      Import manually: ${BUILD_CMD} save ${IMAGE_NAME} | sudo ctr -n k8s.io images import -"
+        fi
+        # Never pull from registry — always use the locally imported image
+        PULL_POLICY="Never"
     fi
 
     # ── Patch and apply k8s manifests ────────────────────────────
     echo ""
     echo "[k8s 4/4] Deploying to Kubernetes (namespace: ${K8S_NS})..."
 
-    # Substitute domain and image into a temporary copy of the manifest
     TMP_MANIFEST="$(mktemp /tmp/vidflow-k8s-XXXX.yaml)"
     sed \
         -e "s|your-registry/vidflow:latest|${IMAGE_NAME}|g" \
         -e "s|hclswl2learninghub|${K8S_DOMAIN}|g" \
-        -e "s|name: vidflow$|name: ${K8S_NS}|" \
+        -e "s|imagePullPolicy: Always|imagePullPolicy: ${PULL_POLICY}|g" \
         k8s/deployment.yaml > "$TMP_MANIFEST"
 
     kubectl apply -f "$TMP_MANIFEST"
     rm -f "$TMP_MANIFEST"
 
+    BUILD_CMD_DISPLAY="${BUILD_CMD}"
     echo ""
     echo "============================================================"
     echo " Kubernetes deployment complete!"
@@ -219,7 +274,12 @@ if [[ "$DEPLOY_CHOICE" == "2" ]]; then
     echo "   https://${K8S_DOMAIN}"
     echo ""
     echo " Update image after a code change:"
-    echo "   docker build -t ${IMAGE_NAME} . && docker push ${IMAGE_NAME}"
+    if [[ "${DO_PUSH,,}" == "y" ]]; then
+        echo "   ${BUILD_CMD_DISPLAY} build -t ${IMAGE_NAME} . && ${BUILD_CMD_DISPLAY} push ${IMAGE_NAME}"
+    else
+        echo "   ${BUILD_CMD_DISPLAY} build -t ${IMAGE_NAME} ."
+        echo "   ${BUILD_CMD_DISPLAY} save ${IMAGE_NAME} | sudo k3s ctr images import -   # (adjust for your k8s)"
+    fi
     echo "   kubectl -n ${K8S_NS} rollout restart deploy/vidflow"
     echo ""
 

@@ -136,25 +136,60 @@ echo.
 
 :: ── Pre-flight checks ─────────────────────────────────────
 echo [k8s 1/4] Checking prerequisites...
-where docker >nul 2>&1
-if %ERRORLEVEL% neq 0 (
-    echo ERROR: Docker is not installed or not in PATH.
-    echo        Install from https://docs.docker.com/get-docker/
+
+:: Detect podman first (common on RHEL/CentOS VMs), fall back to docker
+set "BUILD_CMD="
+where podman >nul 2>&1
+if %ERRORLEVEL% equ 0 (
+    set "BUILD_CMD=podman"
+    echo INFO: podman detected.
+)
+if "!BUILD_CMD!"=="" (
+    where docker >nul 2>&1
+    if %ERRORLEVEL% equ 0 (
+        set "BUILD_CMD=docker"
+        echo INFO: docker detected.
+    )
+)
+if "!BUILD_CMD!"=="" (
+    echo ERROR: Neither podman nor docker is installed or in PATH.
+    echo        podman: https://podman.io/getting-started/installation
+    echo        docker: https://docs.docker.com/get-docker/
     exit /b 1
 )
 where kubectl >nul 2>&1
 if %ERRORLEVEL% neq 0 (
     echo ERROR: kubectl is not installed or not in PATH.
-    echo        Install from https://kubernetes.io/docs/tasks/tools/
+    echo        https://kubernetes.io/docs/tasks/tools/
     exit /b 1
 )
-echo INFO: docker and kubectl found.
+echo INFO: !BUILD_CMD! and kubectl found.
 
 :: ── Collect configuration ─────────────────────────────────
 echo.
 echo [k8s 2/4] Configuration...
-set /p IMAGE_NAME="  Docker image name (e.g. myregistry/vidflow:latest): "
-if "!IMAGE_NAME!"=="" set "IMAGE_NAME=vidflow:latest"
+echo.
+echo   Image name rules:
+echo     Docker Hub    : yourusername/vidflow:latest
+echo     Local registry: registry.hclswl2learninghub:5000/vidflow:latest
+echo     Skip push     : press Enter -- image imported directly into k8s
+echo.
+set /p IMAGE_NAME="  Image name [default: localhost/vidflow:latest]: "
+if "!IMAGE_NAME!"=="" set "IMAGE_NAME=localhost/vidflow:latest"
+
+:: Validate: bare name (no /) maps to docker.io/library/* -- access denied
+echo !IMAGE_NAME! | findstr "/" >nul 2>&1
+if %ERRORLEVEL% neq 0 (
+    echo.
+    echo ERROR: Image name '!IMAGE_NAME!' has no registry or username prefix.
+    echo        docker.io/library/* requires special Docker Hub access.
+    echo.
+    echo   Use one of these formats:
+    echo     yourdockerhubuser/vidflow:latest
+    echo     registry.hclswl2learninghub:5000/vidflow:latest
+    echo     localhost/vidflow:latest   (no push, import directly into k8s)
+    exit /b 1
+)
 
 set /p K8S_DOMAIN="  Public hostname (e.g. hclswl2learninghub): "
 if "!K8S_DOMAIN!"=="" set "K8S_DOMAIN=hclswl2learninghub"
@@ -162,40 +197,52 @@ if "!K8S_DOMAIN!"=="" set "K8S_DOMAIN=hclswl2learninghub"
 set /p K8S_NS="  Kubernetes namespace [default: vidflow]: "
 if "!K8S_NS!"=="" set "K8S_NS=vidflow"
 
-set /p DO_PUSH="  Push image to registry? [Y/n]: "
-if "!DO_PUSH!"=="" set "DO_PUSH=Y"
-
-:: ── Build Docker image ────────────────────────────────────
 echo.
-echo [k8s 3/4] Building Docker image: !IMAGE_NAME!...
-docker build -t "!IMAGE_NAME!" .
+echo   Push options:
+echo     y = push to remote registry (Docker Hub / private registry)
+echo     n = skip push; import image directly into k8s node (no registry needed)
+echo.
+set /p DO_PUSH="  Push image to registry? [y/N]: "
+if "!DO_PUSH!"=="" set "DO_PUSH=N"
+
+:: ── Build image ────────────────────────────────────────────
+echo.
+echo [k8s 3/4] Building image: !IMAGE_NAME!...
+!BUILD_CMD! build -t "!IMAGE_NAME!" .
 if %ERRORLEVEL% neq 0 (
-    echo ERROR: Docker build failed.
+    echo ERROR: Image build failed.
     exit /b 1
 )
 echo INFO: Image built successfully.
 
-if /i "!DO_PUSH!"=="Y" (
+set "PULL_POLICY=Never"
+if /i "!DO_PUSH!"=="y" (
     echo INFO: Pushing image to registry...
-    docker push "!IMAGE_NAME!"
+    !BUILD_CMD! push "!IMAGE_NAME!"
     if %ERRORLEVEL% neq 0 (
-        echo ERROR: docker push failed. Check your registry login.
+        echo ERROR: Push failed. Check registry login: !BUILD_CMD! login docker.io
         exit /b 1
     )
     echo INFO: Push complete.
+    set "PULL_POLICY=Always"
+) else (
+    echo INFO: Skipping registry push -- import the image into k8s manually if needed:
+    echo       !BUILD_CMD! save !IMAGE_NAME! ^| sudo k3s ctr images import -
+    echo       (or: sudo ctr -n k8s.io images import -)
 )
 
-:: ── Apply k8s manifests (via PowerShell sed substitute) ───
+:: ── Apply k8s manifests ────────────────────────────────────
 echo.
 echo [k8s 4/4] Deploying to Kubernetes (namespace: !K8S_NS!)...
 set "TMP_MANIFEST=%TEMP%\vidflow-k8s.yaml"
 powershell -Command ^
-  "(Get-Content k8s\deployment.yaml) ^
+  "(Get-Content 'k8s\deployment.yaml') ^
    -replace 'your-registry/vidflow:latest','!IMAGE_NAME!' ^
    -replace 'hclswl2learninghub','!K8S_DOMAIN!' ^
-   | Set-Content '%TMP_MANIFEST%'"
-kubectl apply -f "%TMP_MANIFEST%"
-del /f "%TMP_MANIFEST%" >nul 2>&1
+   -replace 'imagePullPolicy: Always','imagePullPolicy: !PULL_POLICY!' ^
+   | Set-Content '!TMP_MANIFEST!'"
+kubectl apply -f "!TMP_MANIFEST!"
+del /f "!TMP_MANIFEST!" >nul 2>&1
 
 echo.
 echo ============================================================
@@ -206,11 +253,14 @@ echo  Monitor:
 echo    kubectl -n !K8S_NS! get pods -w
 echo    kubectl -n !K8S_NS! logs deploy/vidflow -f
 echo.
-echo  Access (once DNS points to your Ingress LoadBalancer IP):
+echo  Access (once DNS points to Ingress LoadBalancer IP):
 echo    https://!K8S_DOMAIN!
 echo.
 echo  Update after a code change:
-echo    docker build -t !IMAGE_NAME! . ^& docker push !IMAGE_NAME!
+echo    !BUILD_CMD! build -t !IMAGE_NAME! .
+if /i "!DO_PUSH!"=="y" (
+    echo    !BUILD_CMD! push !IMAGE_NAME!
+)
 echo    kubectl -n !K8S_NS! rollout restart deploy/vidflow
 echo.
 pause
