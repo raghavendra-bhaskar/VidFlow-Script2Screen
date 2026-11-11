@@ -6,7 +6,8 @@
 #   Secret          vidflow-secrets      — API keys (base64-encoded)
 #   PersistentVolumeClaim vidflow-data   — shared storage for recordings/output
 #   Deployment      vidflow              — app pod (Streamlit + internal API server)
-#   Service         vidflow-svc          — ClusterIP for Streamlit (8501) + API (8502)
+#   Service         vidflow-svc          — NodePort for Streamlit (8501)
+#   Service         vidflow-api-svc      — internal ClusterIP for browser API (8502)
 #   Ingress         vidflow-ingress      — HTTPS via cert-manager / nginx-ingress
 #
 # Prerequisites:
@@ -44,9 +45,14 @@ data:
   # Hostname used in TLS cert SANs and shown in the UI
   VIDFLOW_DOMAIN: "hclswl2learninghub"
   # The browser reaches the internal API server via the Ingress /api/ path.
-  # Set to the public hostname so the JS fetch() uses the same HTTPS connection.
+  # Use a same-origin HTTPS URL so browser recording uploads avoid mixed content.
   VIDFLOW_INTERNAL_HOST: "hclswl2learninghub"
   VIDFLOW_INTERNAL_PORT: "443"
+  VIDFLOW_INTERNAL_BASE_URL: "https://hclswl2learninghub/api"
+  VIDFLOW_INTERNAL_BIND: "0.0.0.0"
+  # Ollama runs on the VM host. Replace with its private IP if this hostname
+  # does not resolve to an address reachable from the VidFlow pod.
+  OLLAMA_BASE_URL: "http://hclswl2learninghub:11434"
   # No self-signed SSL inside the pod — nginx-ingress / cert-manager handles TLS
   NO_SSL: "1"
   # Gemini image model (change when newer models release without a code deploy)
@@ -147,18 +153,21 @@ spec:
             - name: data
               mountPath: /app/audio_edits
               subPath: audio_edits
+            - name: data
+              mountPath: /app/voice_library
+              subPath: voice_library
           livenessProbe:
             httpGet:
               path: /_stcore/health
               port: 8501
-              scheme: HTTPS
+              scheme: HTTP
             initialDelaySeconds: 45
             periodSeconds: 15
           readinessProbe:
             httpGet:
               path: /_stcore/health
               port: 8501
-              scheme: HTTPS
+              scheme: HTTP
             initialDelaySeconds: 20
             periodSeconds: 10
       volumes:
@@ -184,10 +193,21 @@ spec:
       port: 8501
       targetPort: 8501
       nodePort: 30501
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vidflow-api-svc
+  namespace: vidflow
+spec:
+  selector:
+    app: vidflow
+  type: ClusterIP
+  ports:
     - name: api
       port: 8502
       targetPort: 8502
-      nodePort: 30502
 
 ---
 # cert-manager ClusterIssuer — creates a Let's Encrypt HTTPS cert automatically.
@@ -253,6 +273,6 @@ spec:
             pathType: Prefix
             backend:
               service:
-                name: vidflow-svc
+                name: vidflow-api-svc
                 port:
                   number: 8502

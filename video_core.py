@@ -347,6 +347,111 @@ def build_subtitle_filter(srt_path):
     return f"subtitles='{escape_subtitle_path(srt_path)}':force_style='{SUBTITLE_STYLE}'"
 
 
+def build_video_overlay_command(
+    base_video_path,
+    overlay_video_path,
+    output_path,
+    size=0.25,
+    position="bottom-right",
+    audio_source="base",
+):
+    """Build an FFmpeg command that places one video over another as picture-in-picture."""
+    if not 0.1 <= size <= 0.5:
+        raise ValueError("Overlay size must be between 0.1 and 0.5.")
+
+    positions = {
+        "top-left": "24:24",
+        "top-right": "main_w-overlay_w-24:24",
+        "bottom-left": "24:main_h-overlay_h-24",
+        "bottom-right": "main_w-overlay_w-24:main_h-overlay_h-24",
+    }
+    if position not in positions:
+        raise ValueError(f"Unsupported overlay position: {position}")
+    if audio_source not in {"base", "overlay", "none"}:
+        raise ValueError(f"Unsupported audio source: {audio_source}")
+
+    filter_graph = (
+        f"[1:v][0:v]scale2ref=w=trunc(main_w*{size}/2)*2:h=-2[pip][base];"
+        f"[base][pip]overlay={positions[position]}:eof_action=pass[vout]"
+    )
+    command = [
+        FFMPEG, "-y", "-i", str(base_video_path), "-i", str(overlay_video_path),
+        "-filter_complex", filter_graph,
+        "-map", "[vout]",
+    ]
+    if audio_source == "none":
+        command.append("-an")
+    else:
+        command += ["-map", f"{0 if audio_source == 'base' else 1}:a?"]
+        command += ["-c:a", "aac", "-b:a", "160k"]
+    command += [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_path),
+    ]
+    return command
+
+
+def build_audio_sync_command(
+    video_path,
+    audio_path,
+    output_path,
+    video_duration,
+    audio_duration,
+    audio_offset=0.0,
+    mode="replace",
+    source_has_audio=True,
+    video_speed=1.0,
+    trim_start=0.0,
+    trim_end=None,
+):
+    """Build the shared A/V sync command used by standalone sync and voice dubbing."""
+    if audio_offset < 0:
+        raise ValueError("Audio offset cannot be negative.")
+    if mode not in {"replace", "mix"}:
+        raise ValueError(f"Unsupported audio sync mode: {mode}")
+    if not 0.5 <= video_speed <= 2.0:
+        raise ValueError("Video speed must be between 0.5 and 2.0.")
+    if trim_start < 0 or (trim_end is not None and not trim_start < trim_end <= video_duration):
+        raise ValueError("Video keep-range must be within the source duration.")
+
+    selected_duration = (trim_end if trim_end is not None else video_duration) - trim_start
+    output_video_duration = selected_duration / video_speed
+    final_duration = max(output_video_duration, audio_offset + audio_duration)
+    delay_ms = int(audio_offset * 1000)
+    video_filter = (
+        f"[0:v]trim=start={trim_start:.3f}:duration={selected_duration:.3f},"
+        f"setpts=(PTS-STARTPTS)/{video_speed:.3f}"
+    )
+    if mode == "mix" and source_has_audio:
+        audio_filter = (
+            f"[1:a]adelay={delay_ms}|{delay_ms}[voice];"
+            f"[0:a]atrim=start={trim_start:.3f}:duration={selected_duration:.3f},"
+            f"asetpts=PTS-STARTPTS,atempo={video_speed:.3f}[original];"
+            "[original][voice]amix=inputs=2:normalize=0:duration=longest,"
+            f"apad=whole_dur={final_duration:.3f}[aout]"
+        )
+    else:
+        audio_filter = (
+            f"[1:a]adelay={delay_ms}|{delay_ms},"
+            f"apad=whole_dur={final_duration:.3f}[aout]"
+        )
+
+    if final_duration > output_video_duration + 0.25:
+        extra_duration = final_duration - output_video_duration + 0.1
+        video_filter += f",tpad=stop_mode=clone:stop_duration={extra_duration:.3f}"
+    video_filter += "[vout]"
+    command = [
+        FFMPEG, "-y", "-i", str(video_path), "-i", str(audio_path),
+        "-filter_complex", f"{video_filter};{audio_filter}",
+        "-map", "[vout]", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22",
+    ]
+    command += [
+        "-map", "[aout]", "-c:a", "aac", "-b:a", "160k",
+        "-movflags", "+faststart", str(output_path),
+    ]
+    return command
+
+
 def build_final_ffmpeg_command(
     silent_video_path,
     audio_path,

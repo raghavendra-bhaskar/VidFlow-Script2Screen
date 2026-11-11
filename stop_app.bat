@@ -7,17 +7,19 @@ set "ROOT=%~dp0"
 pushd "%ROOT%"
 
 if not exist "vidflow.pid" (
-    echo [WARN] vidflow.pid not found — attempting to kill by process name...
-    taskkill /f /fi "windowtitle eq VidFlow*" >nul 2>&1
-    taskkill /f /fi "imagename eq streamlit.exe" >nul 2>&1
-    echo [INFO] Done.
+    echo [WARN] vidflow.pid not found — no process was stopped to avoid affecting other Python apps.
     goto :end
 )
 
 set /p PID=<vidflow.pid
+echo %PID% | findstr /r "^[0-9][0-9]*$" >nul
+if %ERRORLEVEL% neq 0 (
+    echo [ERROR] Invalid PID in vidflow.pid. Check it manually before removing the file.
+    goto :end
+)
 
 echo [INFO] Stopping VidFlow (PID %PID%)...
-taskkill /pid %PID% /f >nul 2>&1
+taskkill /pid %PID% /t /f >nul 2>&1
 if %ERRORLEVEL% equ 0 (
     echo [INFO] VidFlow stopped.
 ) else (

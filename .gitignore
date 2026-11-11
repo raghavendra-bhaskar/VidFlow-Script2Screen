@@ -16,7 +16,9 @@ screen_recordings/
 trimmed_videos/
 merged_videos/
 video+narrated/
+video_webcam_overlay/
 audio/
+voice_library/
 audio_edits/
 uploads/
 *.mp4

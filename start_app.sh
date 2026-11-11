@@ -14,6 +14,7 @@
 #
 # Environment variables (override from .env or shell export):
 #   VIDFLOW_DOMAIN        Comma-separated hostnames/IPs to add to the TLS cert
+#   VIDFLOW_INTERNAL_BASE_URL Full browser URL for the helper API, e.g. https://host/api
 #   VIDFLOW_INTERNAL_HOST Hostname/IP browsers use to reach the API server (port 8502)
 #   VIDFLOW_INTERNAL_PORT Port for the internal API server (default 8502)
 #   PORT                  Streamlit port (default 8501)
@@ -34,6 +35,7 @@ fi
 
 APP_PORT="${PORT:-8501}"
 PYTHON="${SCRIPT_DIR}/.venv/bin/python"
+APP_SCRIPT="${SCRIPT_DIR}/app.py"
 if [[ ! -x "$PYTHON" ]]; then
     echo "ERROR: .venv not found. Run ./install.sh first."
     exit 1
@@ -57,7 +59,7 @@ fi
 # ── Step 2: Start Streamlit ───────────────────────────────────────────────────
 echo "[INFO] Starting VidFlow on port ${APP_PORT}..."
 
-"$PYTHON" -m streamlit run app.py \
+"$PYTHON" -m streamlit run "$APP_SCRIPT" \
     --server.port "${APP_PORT}" \
     --server.address "0.0.0.0" \
     --server.headless true \
@@ -79,4 +81,6 @@ else
 fi
 echo ""
 echo "  Internal API server (trim / screen recorder) will start on port ${VIDFLOW_INTERNAL_PORT:-8502}."
-echo "  If behind a firewall, also open port ${VIDFLOW_INTERNAL_PORT:-8502} or set VIDFLOW_INTERNAL_HOST."
+echo "  Browser API URL: ${VIDFLOW_INTERNAL_BASE_URL:-http://${VIDFLOW_INTERNAL_HOST:-localhost}:${VIDFLOW_INTERNAL_PORT:-8502}}"
+echo "  Ollama URL: ${OLLAMA_BASE_URL:-http://localhost:11434}"
+echo "  In Docker/Kubernetes set OLLAMA_BASE_URL to a VM/private service address reachable from the container."

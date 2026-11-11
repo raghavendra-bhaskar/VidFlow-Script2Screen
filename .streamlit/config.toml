@@ -15,3 +15,15 @@ port = 8501
 # SSL at nginx/Traefik/k8s Ingress and comment these two lines out.
 sslCertFile = "cert.pem"
 sslKeyFile  = "key.pem"
+
+[theme.light]
+primaryColor = "#d84f45"
+backgroundColor = "#fafbf9"
+secondaryBackgroundColor = "#eef2ee"
+textColor = "#202c29"
+
+[theme.dark]
+primaryColor = "#e77b6c"
+backgroundColor = "#181d20"
+secondaryBackgroundColor = "#262e30"
+textColor = "#e8eeea"

@@ -43,6 +43,10 @@
 | **Video editor — Trim** | ✅ | Drag-handle timeline + number inputs; saves to `trimmed_videos/` |
 | **Video editor — Merge** | ✅ | Reorder clips with ↑/↓; saves to `merged_videos/` |
 | **Video editor — A/V Sync** | ✅ | Replace or mix audio at any offset; saves to `video+narrated/` |
+| **Video editor — Self voice dubbing** | ✅ | Record microphone audio in-browser; replace or mix the video's soundtrack |
+| **Video editor — URL video trim** | ❌ | Import public direct-download HTTPS video links (including downloadable public Drive shares), then trim |
+| **Video editor — Voice + webcam** | ✅ | Record webcam + mic and overlay it in the lower-right corner |
+| **Video editor — Video overlay** | ✅ | Picture-in-picture with adjustable size, corner, and soundtrack |
 | **Transcript (Whisper)** | ✅ | faster-whisper offline transcription; download as TXT or SRT |
 | **Screen recorder** | ✅ | Browser MediaRecorder (VP9/WebM) — screen + optional mic |
 | **Auto-narrate (Gemini)** | ❌ | Frame analysis → professional narration script via Gemini vision |
@@ -202,7 +206,7 @@ Converts a plain-text script into a fully rendered MP4 with narration, scenes, a
 
 1. Choose **Video style** in the sidebar:
    - **Animated explainer** — fully offline, no keys required
-   - **AI-generated scenes** — requires `GOOGLE_API_KEY`
+   - **AI-generated scenes** — choose **Gemini image model** (`GOOGLE_API_KEY`) or **Ollama local storyboard** (no API key)
    - **Stock footage** — requires `PEXELS_API_KEY`
 2. Select **Narration engine** in the sidebar:
 
@@ -244,7 +248,7 @@ Add narration at **exact timestamps** in any existing video.
 
 ## Tab 3 — Video editor
 
-Three sub-tabs for non-destructive video editing, all powered by FFmpeg.
+Seven sub-tabs for video editing, powered by FFmpeg and browser media capture.
 
 ### ✂️ Trim
 
@@ -262,11 +266,45 @@ Three sub-tabs for non-destructive video editing, all powered by FFmpeg.
 
 ### 🔊 A/V Sync
 
-1. Upload a **video** and an **audio file**.
+1. Upload a **video** and an **audio file** (MP3, WebM, WAV, or other supported format), or choose a saved voice sample.
 2. Choose **Replace video audio** or **Mix with existing audio**.
-3. Set **Audio start offset** (seconds delay before audio begins).
-4. Click **🔊 Sync audio to video** — output saved to `video+narrated/`.
-5. Download and Save buttons persist across reruns (stored in session state).
+3. Set **Audio start offset** (seconds delay before audio begins). Video/audio durations and the expected export length appear alongside the **Keep video range** and **Export video speed** controls. Moving the range attempts to match the audio automatically when 0.5x–2x permits; **Match video length to audio** can also set speed explicitly. The existing Trim audio sub-tab can shorten the audio when needed. Mixed original audio keeps its pitch.
+4. Click **🔊 Sync audio to video**. The result remains available for download during the session.
+5. Use **Download synced MP4** or click **Save to video+narrated/** to keep a copy.
+
+At upload controls, expand **Or import from Google Drive** to paste a public file-sharing link instead of choosing a local file. The file must be accessible without sign-in; links to Drive folders are not supported. For private Drive files, use Upload to select a copy from a Google Drive desktop-synced folder. An authenticated Google Drive file picker requires Google OAuth configuration and is not included.
+
+### 🎙 Self voice dubbing
+
+1. Upload the video; its player appears in this tab.
+2. Play the video, start microphone recording below it, and narrate along. Stop when finished.
+3. Click **Refresh voice recordings**, select your recording, and choose replace or mix. Use **Convert recording to MP3** to transcode and download it, or explicitly save it to the voice library for reuse in A/V Sync.
+4. Adjust **Voice start offset** if recording began after the video, then create the dubbed MP4.
+5. The result stays in the current session until you download it or click one of the Save buttons.
+
+This uses your actual microphone recording. It does not clone or isolate your voice into the sidebar TTS voice list. Face lip-sync for short video clips is available separately in the Audio editor through a consent-gated cloud provider. Saved voice recordings on an unauthenticated deployment are accessible to anyone using that deployment. Do not store sensitive voice samples there.
+
+### 🌐 URL video trim
+
+1. Enter a direct-video, Drive, or YouTube URL. Use **Preview URL in application** to play it in the browser, or **Load video URL** to download/import it for trimming. Confirm that you own a YouTube video or have permission to download it.
+2. Drive preview may use the browser's signed-in session. Importing for trim is a server download and requires the file to be publicly accessible with downloads allowed; browser sign-in is not shared with VidFlow.
+3. Set the trim start/end and save the MP4 to `trimmed_videos/`.
+
+YouTube import supports watch, Shorts, embed, live, and `youtu.be` video links through `yt-dlp`; the video must be accessible and provide an MP4 stream. Facebook and Instagram page URLs are not extracted. Direct URLs must be public, resolve to public internet addresses, return video content, and be no larger than 1 GB. A video playable in a Learning Hub embed is not necessarily downloadable from VidFlow: private Drive shares may use the browser's signed-in session or disallow downloads. VidFlow does not use or request your browser's Google cookies.
+
+### 📷 Voice + webcam
+
+1. Upload or import the main video; preview it while recording camera and microphone in the browser.
+2. Refresh recordings, choose the new webcam clip, set its size, and choose the soundtrack.
+3. The webcam clip is composited in the lower-right corner. The result is not saved to disk unless you click Save.
+4. Use **Download webcam-dubbed video**, **Save to video_webcam_overlay/**, or **Save to video+narrated/**.
+
+### 🖼 Video overlay
+
+1. Upload the full-screen video and the clip to place on top.
+2. Choose the overlay corner, width, and which clip supplies the soundtrack.
+3. Create the picture-in-picture MP4; it remains in the current session until downloaded or saved.
+4. Use **Download picture-in-picture video**, **Save to video_webcam_overlay/**, or **Save to video+narrated/**.
 
 ---
 
@@ -291,8 +329,10 @@ Records your screen directly in the browser using the Web MediaRecorder API.
 2. Record your content; the elapsed timer is shown.
 3. Click **■ Stop recording** to finish.
 4. Preview the recording and click **⬇ Download recording (WebM)**.
-5. Upload the downloaded file via **Save recording to project** — saved to `screen_recordings/` with a timestamp name.
-6. All saved recordings are listed below with individual playback and download buttons.
+5. The recording is automatically saved to `screen_recordings/`; the download link is also available as a backup.
+6. Saved recordings are not listed in this tab; use the in-browser download link immediately after recording or open the server's `screen_recordings/` folder.
+
+Capture requests up to 1920x1080 at 30 fps and uses an 8 Mbps video bitrate. The browser reports the actual capture dimensions, which may be lower if the shared source is smaller.
 
 > HTTPS is recommended when accessing from a second device on the LAN so `getDisplayMedia` works without browser restrictions.
 
@@ -307,7 +347,7 @@ Analyses evenly-spaced frames from any video and writes a professional narration
 | Backend | Requirement | Notes |
 |---|---|---|
 | **Gemini (Google Cloud)** | `GOOGLE_API_KEY` in `.env` | Fast, high quality; uses `gemini-2.0-flash` by default |
-| **Ollama (local)** | Ollama running at `localhost:11434` | Fully offline; needs a vision model (see below) |
+| **Ollama (local)** | Ollama reachable at `OLLAMA_BASE_URL` (default `http://localhost:11434`) | Fully offline after the vision model is downloaded |
 
 When both are available a radio button lets you choose. When only Ollama is available it is selected automatically.
 
@@ -315,14 +355,48 @@ When both are available a radio button lets you choose. When only Ollama is avai
 
 ```bash
 # Install Ollama — https://ollama.com
-ollama pull llava          # recommended general-purpose vision model
-# or
-ollama pull moondream      # lightweight, fast
-# or
-ollama pull bakllava       # BakLLaVA — strong visual understanding
+ollama pull llava:7b       # general-purpose vision model; smaller than the 34B variant
+ollama list                # verify that the model is installed
 ```
 
-> **Text-only models (e.g. `llama3`, `gemma3`) will return HTTP 400.** The UI shows a warning immediately when a non-vision model is selected. Pull a vision model before using this tab.
+`llama3.2:latest` and `qwen2.5:7b` are text-only models; they cannot analyze extracted video frames. `llava:34b` supports vision but is a large download and needs substantially more RAM/VRAM. If the VM has limited resources, cancel that pull with `Ctrl+C` and use `llava:7b` or `moondream` instead.
+
+### Using Ollama from a VM or Kubernetes
+
+When VidFlow and Ollama run directly on the same machine, keep `OLLAMA_BASE_URL=http://localhost:11434`. In Docker or Kubernetes, `localhost` means the app container/pod, not the VM. Set `OLLAMA_BASE_URL` to the VM's private address as reachable from the pod, for example `http://10.0.0.10:11434`.
+
+Ollama listens on loopback by default. To allow the VidFlow pod to reach it, configure the Ollama service on the VM to listen on the VM's private interface (or `0.0.0.0:11434`), then restrict the VM firewall to the Kubernetes node/pod network. Do not expose port `11434` to the public internet; the Ollama API has no built-in authentication.
+
+On a systemd Linux VM, one way to configure the service is:
+
+```bash
+sudo systemctl edit ollama
+```
+
+Add this override, then restart Ollama:
+
+```ini
+[Service]
+Environment="OLLAMA_HOST=0.0.0.0:11434"
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart ollama
+curl http://127.0.0.1:11434/api/tags
+```
+
+Set `OLLAMA_BASE_URL` in the `vidflow-config` ConfigMap to the VM's private IP/DNS name, then restart VidFlow and test from the pod:
+
+```bash
+kubectl edit configmap vidflow-config -n vidflow
+# Set OLLAMA_BASE_URL to http://<VM-PRIVATE-IP>:11434, then save and exit.
+kubectl rollout restart deploy/vidflow -n vidflow
+kubectl rollout status deploy/vidflow -n vidflow
+kubectl exec -n vidflow deploy/vidflow -- python -c "import urllib.request; print(urllib.request.urlopen('http://10.0.0.10:11434/api/tags', timeout=5).read().decode())"
+```
+
+Replace `10.0.0.10` with the same private address configured in `OLLAMA_BASE_URL`. If the test fails, check Ollama's bind address, host firewall, and whether the pod network can route to that VM address. Once reachable, Auto-narrate lists installed models; choose a vision model such as `llava:7b` and analyze the video.
 
 ### Usage
 
@@ -336,7 +410,7 @@ ollama pull bakllava       # BakLLaVA — strong visual understanding
 
 ## Tab 7 — Audio editor
 
-Three sub-tabs for audio-only editing.
+Four sub-tabs for audio editing and lip-sync video generation.
 
 ### 🎤 Text → Audio (TTS)
 
@@ -358,12 +432,18 @@ Three sub-tabs for audio-only editing.
 - Click **Merge** → all files re-encoded to MP3 192 kbps and concatenated.
 - Auto-saved to `audio_edits/`; **💾 Save to audio/** button also available.
 
+### Lip sync
+
+- Set a server-side `FAL_KEY` and install the listed Python dependencies. Upload a consenting subject's 2–10 second MP4/MOV/WebM face clip and speech audio (2–60 seconds, under 5 MB). WebM is converted to 720p MP4 before upload; video input and conversion are limited to 100 MB.
+- Confirm consent to send both files to fal. **Generate lip-synced video** calls Kling LipSync to animate mouth movement; preview/download the resulting MP4 in the same session. This cloud service may incur charges and cannot process long-form videos or still images in this workflow.
+- No `FAL_KEY` available: use **Create local dubbed video (no API key)**. This replaces video audio locally (no cloud call, no mouth animation).
+
 ---
 
 ## Full workflow: Record → Narrate → Export
 
 ```
-1. Tab 5  → Record screen → Stop → Download WebM → Upload to "Save recording to project"
+1. Tab 5  → Record screen → Stop (the WebM is auto-saved)
 2. Tab 6  → Upload saved recording → Analyse → edit generated script
 3. Tab 2  → Upload video → paste script → set segment timestamps → Generate narration & merge
 4. Tab 3  → Trim sub-tab (optional) → clean up start/end
@@ -375,15 +455,24 @@ Three sub-tabs for audio-only editing.
 
 ## API keys (all optional)
 
-All keys are optional. The app works **fully offline** in **Animated explainer** mode with local `pyttsx3` TTS and Ollama for auto-narration.
+All keys are optional for the core editor. The app works **fully offline** in **Animated explainer** mode with local `pyttsx3` TTS and Ollama for auto-narration. Cloud lip sync requires `FAL_KEY`, while local dubbed-video fallback does not.
 
 | Key | Purpose | Where to get it |
 |---|---|---|
 | `GOOGLE_APPLICATION_CREDENTIALS` | Google Cloud TTS (neural Indian English voices + pitch) | [Cloud Console](https://console.cloud.google.com/) → Text-to-Speech API → Service account JSON |
 | `GOOGLE_API_KEY` | Gemini image generation (AI scenes) + Auto-narrate vision | [Google AI Studio](https://aistudio.google.com/) |
 | `PEXELS_API_KEY` | Stock footage search | [Pexels API](https://www.pexels.com/api/) |
+| `FAL_KEY` | Optional cloud Kling lip sync in Audio editor; may incur charges | [fal dashboard](https://fal.ai/dashboard/keys) |
 
 Set them in `.env` (copy from `.env.example`). **Never commit `.env` to source control.**
+
+Runtime endpoints are configuration values, not API keys:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `OLLAMA_BASE_URL` | Ollama server accessed by VidFlow | `http://localhost:11434` |
+| `VIDFLOW_INTERNAL_BASE_URL` | Browser-visible helper API URL; set to the HTTPS Ingress `/api` route for Kubernetes | derived from host/port when blank |
+| `VIDFLOW_INTERNAL_BIND` | Interface used by the helper API server | `127.0.0.1`; containers set `0.0.0.0` |
 
 ---
 
@@ -413,24 +502,29 @@ scp -r "D:\AI\VidFlow-Script2Screen" hcluser@10.115.54.50:~/VidFlow-Script2Scree
 cd ~/VidFlow-Script2Screen
 podman build -t localhost/vidflow:latest .
 podman save localhost/vidflow:latest | sudo k3s ctr images import -
+kubectl apply -f k8s/deployment.yaml
 kubectl rollout restart deploy/vidflow -n vidflow
 kubectl -n vidflow rollout status deploy/vidflow
 ```
 
 ### Quick in-pod file update (no rebuild needed)
 
-Use this when only `app.py` / `video_core.py` changed, to avoid a full image rebuild.
+Use this when only Python source changed, to avoid a full image rebuild. Copy all changed modules imported by `app.py`.
 Edge-tts must already be installed in the pod from a previous session.
 
 ```bash
 # From Windows — copy files to VM first
 scp "D:\AI\VidFlow-Script2Screen\app.py" hcluser@10.115.54.50:~/
 scp "D:\AI\VidFlow-Script2Screen\video_core.py" hcluser@10.115.54.50:~/
+scp "D:\AI\VidFlow-Script2Screen\ollama_client.py" hcluser@10.115.54.50:~/
+scp "D:\AI\VidFlow-Script2Screen\media_import.py" hcluser@10.115.54.50:~/
 
 # On VM — copy into running pod
 POD=$(kubectl get pods -n vidflow -l app=vidflow -o jsonpath='{.items[0].metadata.name}')
 kubectl cp ~/app.py vidflow/$POD:/app/app.py
 kubectl cp ~/video_core.py vidflow/$POD:/app/video_core.py
+kubectl cp ~/ollama_client.py vidflow/$POD:/app/ollama_client.py
+kubectl cp ~/media_import.py vidflow/$POD:/app/media_import.py
 # Streamlit auto-reloads within ~5 seconds (file watcher)
 
 # Install edge-tts if not already in the pod
@@ -441,18 +535,28 @@ kubectl exec -n vidflow $POD -- pip install "edge-tts>=6.1.9"
 
 | URL | Description |
 |---|---|
-| `https://hclswl2learninghub:30501` | VidFlow Streamlit UI (NodePort) |
-| `https://hclswl2learninghub:30502` | Internal API server |
+| `https://hclswl2learninghub/` | VidFlow through Ingress; use this for browser camera/screen capture and editor uploads |
+| `http://hclswl2learninghub:30501` | Streamlit UI NodePort (UI only; editor browser uploads require the Ingress `/api/` route) |
+
+The editor API is an internal `ClusterIP` service routed through Ingress at `/api/`; it is not exposed as a public NodePort. If you only have NodePort access, configure an HTTPS reverse proxy that routes `/api/` to service port 8502 before using browser-recording features. The direct NodePort URL is HTTP with this manifest; HTTPS is terminated by Ingress.
 
 ### HCL Learning Hub integration
 
 In the admin panel → Settings → Integrations → VidFlow:
-- **VidFlow Server URL**: `https://hclswl2learninghub:30501`
+- **VidFlow Server URL**: `https://hclswl2learninghub/` (Ingress URL for the Hub integration)
 - Click **Check Status** — the Learning Hub server probes `/_stcore/health` on the VidFlow pod using `https.request` with `rejectUnauthorized: false` (self-signed cert accepted).
 
 ---
 
 ## Uninstalling
+
+Windows:
+
+```powershell
+.\uninstall.bat
+```
+
+Linux/macOS:
 
 ```bash
 chmod +x uninstall.sh
@@ -462,6 +566,8 @@ chmod +x uninstall.sh
 #   2 = k8s only (delete namespace + imported image)
 #   3 = Both
 ```
+
+The uninstallers do not uninstall Ollama or delete downloaded Ollama models. They also ask separately before removing project media, certificates, `.env`, or the Python environment.
 
 ---
 
@@ -488,12 +594,14 @@ $env:RUN_REAL_TTS_TEST="true"
 VidFlow-Script2Screen/
 ├── app.py                   # Streamlit UI — 7 tabs + sidebar
 ├── video_core.py            # Core pipeline: TTS (edge-tts/pyttsx3/GCloud), FFmpeg, SRT
+├── ollama_client.py         # Configurable Ollama API URL helpers
+├── media_import.py          # Public Google Drive share-link download helpers
 ├── gen_cert.py              # One-time HTTPS certificate generator (self-signed)
 ├── requirements.txt         # Python dependencies (includes edge-tts>=6.1.9)
 ├── .env.example             # Template for API keys + VIDFLOW_DOMAIN
 ├── install.bat              # Windows automated installer (5-step)
 ├── install.sh               # Linux/macOS automated installer (5-step)
-├── uninstall.sh             # Remove VM install and/or k8s resources
+├── uninstall.bat / .sh      # Remove VM install and/or k8s resources with confirmation
 ├── start_app.sh / .bat      # Start VidFlow in background (VM mode)
 ├── stop_app.sh  / .bat      # Stop background VidFlow process
 ├── Dockerfile               # Container image (Python 3.12, ffmpeg, espeak-ng)
@@ -511,6 +619,8 @@ VidFlow-Script2Screen/
 ├── trimmed_videos/          # Trim sub-tab outputs
 ├── merged_videos/           # Merge sub-tab outputs
 ├── video+narrated/          # A/V Sync + merge narrated video outputs
+├── video_webcam_overlay/    # Composite renders explicitly saved by the user
+├── voice_library/           # Explicitly saved reusable voice recordings (shared on server)
 ├── uploads/                 # Temporary upload cache
 ├── tests/
 │   └── test_video_core.py   # Unit + integration tests
@@ -523,7 +633,7 @@ VidFlow-Script2Screen/
 
 - **Phase 1** ✅ Offline TTS, animated explainer, subtitles, MP4 render
 - **Phase 2** ✅ Screen recorder + audio merge with offset sync
-- **Phase 3** ✅ Video editor (Trim / Merge / A/V Sync)
+- **Phase 3** ✅ Video editor (Trim / Merge / A/V Sync / voice dubbing / URL trim / overlays)
 - **Phase 4** ✅ Transcript (faster-whisper), Auto-narrate (Gemini + Ollama)
 - **Phase 5** ✅ Audio editor (TTS / Trim / Merge), HTTPS, system voice selection
 - **Phase 5b** ✅ Neural TTS via edge-tts (Microsoft Edge voices), Kubernetes deployment, uninstall script

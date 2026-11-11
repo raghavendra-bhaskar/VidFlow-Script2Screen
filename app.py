@@ -12,13 +12,17 @@ Tab 2  Upload video + narrate
     Each segment is individually synthesised; 2-pass rate-matching fits speech to a time window.
     Uses FFmpeg adelay + amix + apad to place audio without overlap and extend if needed.
 
-Tab 3  Video editor  (3 sub-tabs)
+Tab 3  Video editor  (7 sub-tabs)
     Trim   — drag-handle timeline (served by a local HTTP server on port 8502) + number inputs.
              FFmpeg re-encodes trimmed clips; saved to trimmed_videos/.
     Merge  — concatenate clips in a user-defined order via FFmpeg concat demuxer.
              Saved to merged_videos/; results persisted in session_state for rerun safety.
     A/V Sync — replace or mix audio at a configurable offset; pad/extend video if audio is longer.
              Saved to video+narrated/; results persisted in session_state.
+    Self voice dubbing — browser microphone recording used to replace or mix the video's soundtrack.
+    URL video trim — import a public direct-download video URL and save a trimmed MP4.
+    Voice + webcam — record camera + microphone and overlay the recording in the lower-right corner.
+    Video overlay — place one uploaded video over another with configurable size and position.
 
 Tab 4  Transcript
     faster-whisper offline ASR converts any video/audio to timestamped text.
@@ -68,13 +72,21 @@ if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 import os, re, tempfile, subprocess, time, requests, textwrap, logging, threading, shutil, warnings
+import ipaddress, socket
 from pathlib import Path
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import quote as _url_quote
+from urllib.parse import quote as _url_quote, urljoin as _url_join, urlparse as _url_parse, parse_qs as _url_parse_qs, urlencode as _url_encode
 import streamlit as st
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
+from media_import import (
+    browser_video_preview_url,
+    download_authorized_youtube_video,
+    google_drive_confirmation_url,
+    normalize_google_drive_url,
+)
+from ollama_client import get_ollama_api_url, get_ollama_base_url
 
 # Silence noisy Streamlit deprecation notices in the server log
 logging.getLogger("streamlit.runtime.scriptrunner_utils").setLevel(logging.ERROR)
@@ -84,17 +96,64 @@ warnings.filterwarnings("ignore", message=r".*st\.iframe.*")
 from google import genai
 from google.genai import types
 from PIL import Image, ImageDraw, ImageFont
-from video_core import FFMPEG, FFPROBE, build_final_ffmpeg_command, create_tts, create_tts_edge, create_tts_offline, list_edge_voices, list_offline_voices, sentences, write_srt
+from video_core import FFMPEG, FFPROBE, build_audio_sync_command, build_final_ffmpeg_command, build_video_overlay_command, create_tts, create_tts_edge, create_tts_offline, list_edge_voices, list_offline_voices, sentences, write_srt
+
+
+def _ollama_available():
+    try:
+        import urllib.request
+        urllib.request.urlopen(get_ollama_api_url("api/tags"), timeout=2)
+        return True
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=60)
+def _ollama_models():
+    try:
+        import urllib.request
+        import json as _json
+        with urllib.request.urlopen(get_ollama_api_url("api/tags"), timeout=3) as response:
+            data = _json.loads(response.read())
+        return [model["name"] for model in data.get("models", [])]
+    except Exception:
+        return []
 
 load_dotenv()
-st.set_page_config(page_title="Text to Video AI", page_icon="🎬", layout="wide")
+st.set_page_config(page_title="VidFlow Studio", page_icon="🎬", layout="wide")
 ROOT = Path(__file__).parent
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap');
+:root { --accent:#d84f45; --line:color-mix(in srgb, currentColor 18%, transparent); }
+html, body, [class*="css"], [data-testid="stAppViewContainer"] {
+    font-family:'DM Sans','Segoe UI',sans-serif;
+}
+[data-testid="stSidebar"] { border-right:1px solid var(--line); }
+.block-container { max-width:1420px; padding-top:2rem; }
+h1 { font-size:2rem !important; font-weight:700 !important; letter-spacing:0 !important; }
+h2, h3 { font-weight:700 !important; letter-spacing:0 !important; }
+[data-baseweb="tab-list"] { border-bottom:1px solid var(--line); gap:.3rem; }
+[data-baseweb="tab"] { font-weight:600; padding:.7rem .8rem; }
+[data-testid="stFileUploader"] section, [data-testid="stExpander"] {
+    border-color:var(--line) !important; border-radius:6px !important;
+}
+[data-testid="stButton"] button, [data-testid="stDownloadButton"] button {
+    border-radius:6px; font-weight:600; min-height:2.55rem;
+}
+[data-testid="stButton"] button:focus-visible, [data-testid="stDownloadButton"] button:focus-visible {
+    outline:2px solid var(--accent); outline-offset:2px;
+}
+video { border-radius:6px; background:#10191b; }
+@media (max-width:760px) { .block-container { padding:1rem .85rem; } }
+</style>
+""", unsafe_allow_html=True)
 
 DEFAULT_SCRIPT = ("Artificial Intelligence is transforming the world. "
                   "AI helps automate tasks, improve productivity, and make smarter decisions.")
 
-st.title("🎬 Text to Video AI")
-st.caption("A local-first prototype: script → voice → scenes → subtitles → MP4")
+st.title("VidFlow Studio")
 
 with st.sidebar:
     st.header("Video settings")
@@ -104,6 +163,33 @@ with st.sidebar:
         "Animated explainer",
         "Talking AI presenter (provider integration)"
     ])
+    scene_backend = "Gemini image model"
+    scene_ollama_model = None
+    if style == "AI-generated scenes":
+        _scene_gemini_ok = bool(os.getenv("GOOGLE_API_KEY"))
+        _scene_ollama_ok = _ollama_available()
+        if _scene_gemini_ok and _scene_ollama_ok:
+            scene_backend = st.radio(
+                "Scene generation backend",
+                ["Gemini image model", "Ollama local storyboard"],
+                horizontal=True,
+                key="scene_backend",
+            )
+        elif _scene_gemini_ok:
+            scene_backend = "Gemini image model"
+        elif _scene_ollama_ok:
+            scene_backend = "Ollama local storyboard"
+            st.info("Using local Ollama for AI-generated storyboard cards because GOOGLE_API_KEY is not set.")
+        else:
+            st.warning("Set GOOGLE_API_KEY or run Ollama to use AI-generated scenes.")
+        if scene_backend == "Ollama local storyboard":
+            _models = _ollama_models()
+            scene_ollama_model = st.selectbox(
+                "Ollama model (text)",
+                _models if _models else ["llama3.2"],
+                key="scene_ollama_model",
+                help="Used to write cinematic scene directions rendered as local storyboard cards.",
+            )
     # ── TTS engine selection ──────────────────────────────────────────────
     cloud_tts_available = bool(os.getenv("GOOGLE_APPLICATION_CREDENTIALS"))
     # On Linux pyttsx3 uses espeak-ng which sounds robotic; default to Neural.
@@ -159,6 +245,147 @@ def run(cmd):
     if p.returncode:
         raise RuntimeError(p.stderr[-2500:] or "Command failed")
     return p.stdout.strip()
+
+
+def _download_direct_media_url(
+    url: str, destination: Path, max_bytes: int = 1_000_000_000, media_kind: str = "video"
+):
+    """Download public video/audio media, including Drive's confirmation flow."""
+    if media_kind not in {"video", "audio", "media"}:
+        raise ValueError(f"Unsupported media type: {media_kind}")
+    current_url, is_drive_share = normalize_google_drive_url(url.strip())
+    if _url_parse(current_url).hostname in {
+        "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"
+    }:
+        raise ValueError("Use Preview URL to play a YouTube link, or Load video URL to import a video you are authorized to download.")
+    session = requests.Session()
+    for _ in range(6):
+        parsed = _url_parse(current_url)
+        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("Use a public HTTPS link directly to a media file.")
+        if parsed.port not in (None, 443):
+            raise ValueError("Media URLs on custom ports are not supported.")
+        try:
+            addresses = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise ValueError("The media URL host could not be resolved.") from exc
+        if not addresses or any(
+            not ipaddress.ip_address(address[4][0].split("%", 1)[0]).is_global
+            for address in addresses
+        ):
+            raise ValueError("The media URL must resolve only to public internet addresses.")
+
+        response = session.get(
+            current_url, stream=True, allow_redirects=False, timeout=(10, 60),
+            headers={"User-Agent": "VidFlow/1.0"},
+        )
+        if response.status_code in {301, 302, 303, 307, 308}:
+            next_url = response.headers.get("Location")
+            response.close()
+            if not next_url:
+                raise ValueError("The media host returned an invalid redirect.")
+            current_url = _url_join(current_url, next_url)
+            if is_drive_share and _url_parse(current_url).hostname == "accounts.google.com":
+                raise ValueError(
+                    "Google Drive requires sign-in to download this file. VidFlow's server cannot use "
+                    "your browser's Google session. Use Preview URL to play it in a signed-in browser; "
+                    "to trim it, enable link access/download in Drive or export and upload the file."
+                )
+            continue
+        if response.status_code >= 400:
+            response.close()
+            raise ValueError(f"The media host returned HTTP {response.status_code}.")
+        content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+        content_length = response.headers.get("Content-Length")
+        if content_length and int(content_length) > max_bytes:
+            response.close()
+            raise ValueError("Media URL exceeds the 1 GB import limit.")
+        if content_type in {"text/html", "application/xhtml+xml"} and is_drive_share:
+            warning_cookies = dict(session.cookies)
+            warning_cookies.update(response.cookies)
+            confirm_token = next(
+                (value for name, value in warning_cookies.items() if name.startswith("download_warning")),
+                None,
+            )
+            if confirm_token and "confirm" not in _url_parse_qs(_url_parse(current_url).query):
+                parsed_query = _url_parse(current_url)
+                query = _url_parse_qs(parsed_query.query)
+                query["confirm"] = [confirm_token]
+                current_url = parsed_query._replace(query=_url_encode(query, doseq=True)).geturl()
+                response.close()
+                continue
+
+            html_bytes = bytearray()
+            for chunk in response.iter_content(chunk_size=65536):
+                html_bytes.extend(chunk)
+                if len(html_bytes) >= 1_000_000:
+                    break
+            confirmation_url = google_drive_confirmation_url(
+                current_url, html_bytes.decode("utf-8", errors="replace")
+            )
+            response.close()
+            if not confirmation_url:
+                raise ValueError(
+                    "Google Drive returned a web page instead of the file. Check that the link "
+                    "opens the file directly, General access is Anyone with the link, and your "
+                    "organization does not require sign-in or block downloads."
+                )
+            current_url = confirmation_url
+            continue
+        is_binary = content_type in {
+            "application/octet-stream", "binary/octet-stream", "application/force-download",
+            "application/download", "application/mp4", "application/x-matroska",
+        }
+        has_expected_type = (
+            content_type.startswith("video/") if media_kind == "video" else
+            content_type.startswith("audio/") if media_kind == "audio" else
+            content_type.startswith(("video/", "audio/"))
+        )
+        if not is_binary and not has_expected_type:
+            response.close()
+            raise ValueError(
+                f"That URL did not return a {media_kind} file. For Drive, allow Anyone with "
+                "the link and use a direct file link."
+            )
+
+        total = 0
+        try:
+            with destination.open("wb") as video_file:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    total += len(chunk)
+                    if total > max_bytes:
+                        raise ValueError("Media URL exceeds the 1 GB import limit.")
+                    video_file.write(chunk)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+        finally:
+            response.close()
+        if total == 0:
+            destination.unlink(missing_ok=True)
+            raise ValueError("The media URL returned an empty file.")
+        return destination
+    raise ValueError("The media URL redirected too many times.")
+
+
+def _download_direct_video_url(url: str, destination: Path, max_bytes: int = 1_000_000_000):
+    """Backward-compatible video-only wrapper for the URL trim tab."""
+    return _download_direct_media_url(url, destination, max_bytes, "video")
+
+
+def _validate_muxed_media(path: Path):
+    """Do not report a mux as complete unless it contains playable video and audio."""
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError("FFmpeg did not create an output video.")
+    for stream_type in ("v:0", "a:0"):
+        stream = run([
+            FFPROBE, "-v", "error", "-select_streams", stream_type,
+            "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(path),
+        ])
+        if not stream:
+            raise RuntimeError(f"The output video is missing its {stream_type[0]} stream.")
 
 
 def _probe_duration(path: Path) -> float:
@@ -219,7 +446,7 @@ def _probe_duration(path: Path) -> float:
         pass
 
     # ── Strategy 2: FFmpeg copy-remux ─────────────────────────────────────────
-    _remux = path.with_name(path.stem + "__dur_fix" + path.suffix)
+    _remux = path.with_name(path.stem + "__dur_fix.mkv")
     try:
         r = subprocess.run(
             [FFMPEG, "-y", "-i", str(path), "-c", "copy", str(_remux)],
@@ -241,9 +468,9 @@ def _probe_duration(path: Path) -> float:
             _remux.unlink(missing_ok=True)
 
     raise ValueError(
-        f"Cannot determine duration of '{path.name}'.  "
-        "For browser-recorded WebM files, open in VLC → Media → Convert/Save → "
-        "choose MP4 profile → save, then re-upload the MP4."
+        f"Cannot determine duration of '{path.name}'. Check that it plays in the preview; "
+        "renaming a WebM recording to .mp3 does not convert it. Use the Convert to MP3 button "
+        "in Self voice dubbing and upload the converted file."
     )
 
 def dims():
@@ -383,6 +610,96 @@ MERGED_DIR.mkdir(exist_ok=True)
 # Output directory for narrated videos (tab 2 "Save" button)
 NARRATED_DIR = ROOT / "video+narrated"
 NARRATED_DIR.mkdir(exist_ok=True)
+VOICE_LIBRARY_DIR = ROOT / "voice_library"
+VOICE_LIBRARY_DIR.mkdir(exist_ok=True)
+
+
+def _convert_recording_to_mp3(source: Path, destination: Path):
+    """Transcode a browser recording; a renamed WebM is not an MP3."""
+    run([FFMPEG, "-y", "-i", str(source), "-vn", "-c:a", "libmp3lame",
+         "-b:a", "192k", str(destination)])
+    if not destination.is_file() or destination.stat().st_size == 0:
+        raise RuntimeError("The recording has no usable audio stream.")
+    return destination
+
+# Final self-voice, webcam, and picture-in-picture renders are saved here.
+COMPOSITE_DIR = ROOT / "video_webcam_overlay"
+COMPOSITE_DIR.mkdir(exist_ok=True)
+
+
+class _ImportedMediaFile:
+    """File-uploader-compatible view of a media file downloaded from Drive."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.name = path.name
+        self.size = path.stat().st_size
+
+    def read(self):
+        return self.path.read_bytes()
+
+    def getvalue(self):
+        return self.read()
+
+
+def _media_uploader(label, file_types, key, media_kind="video", multiple=False, max_upload_size=None):
+    """Offer a normal local picker plus an optional public Drive link import."""
+    uploaded = st.file_uploader(
+        label, type=file_types, key=key, accept_multiple_files=multiple,
+        max_upload_size=max_upload_size,
+    )
+    with st.expander("Or import from Google Drive", expanded=False):
+        st.caption("For private files, use Upload to choose a file from a Google Drive desktop-synced folder. Public links do not need sign-in.")
+        drive_url = st.text_input(
+            "Public Google Drive file link", key=f"{key}_drive_url",
+            placeholder="https://drive.google.com/file/d/.../view",
+        )
+        if st.button("Import from Drive", key=f"{key}_drive_import"):
+            st.session_state.pop(f"{key}_drive_path", None)
+            if not drive_url.strip():
+                st.error("Paste a Google Drive file link first.")
+            else:
+                try:
+                    import_dir = Path(tempfile.mkdtemp(prefix="drive_import_", dir=UPLOADS_DIR))
+                    imported_path = import_dir / "drive_media.bin"
+                    _download_direct_media_url(drive_url, imported_path, media_kind=media_kind)
+                    streams = run([
+                        FFPROBE, "-v", "error", "-show_entries", "stream=codec_type",
+                        "-of", "csv=p=0", str(imported_path),
+                    ]).splitlines()
+                    if media_kind != "media" and media_kind not in streams:
+                        raise ValueError(f"This Drive file has no {media_kind} stream.")
+                    if media_kind == "media" and not set(streams) & {"audio", "video"}:
+                        raise ValueError("This Drive file contains no playable audio or video.")
+                    container_format = run([
+                        FFPROBE, "-v", "error", "-show_entries", "format=format_name",
+                        "-of", "default=nw=1:nk=1", str(imported_path),
+                    ]).split(",")
+                    suffix = next((
+                        extension for format_name, extension in (
+                            ("webm", ".webm"), ("matroska", ".mkv"),
+                            ("mp3", ".mp3"), ("wav", ".wav"), ("ogg", ".ogg"),
+                            ("flac", ".flac"), ("mov", ".mp4"), ("mp4", ".mp4"),
+                        ) if format_name in container_format
+                    ), ".mp3" if media_kind == "audio" else ".mp4")
+                    imported_path = imported_path.rename(import_dir / f"drive_media{suffix}")
+                    st.session_state[f"{key}_drive_path"] = str(imported_path)
+                    st.success("Drive file imported.")
+                except Exception as exc:
+                    if 'imported_path' in locals():
+                        imported_path.unlink(missing_ok=True)
+                    st.error(str(exc))
+
+    if multiple:
+        if uploaded:
+            return uploaded
+    elif uploaded and uploaded.size > 0:
+        return uploaded
+    imported_path = Path(st.session_state.get(f"{key}_drive_path", ""))
+    if imported_path.is_file():
+        imported = _ImportedMediaFile(imported_path)
+        return [imported] if multiple else imported
+    return [] if multiple else None
 
 # Output directory for audio editor results
 AUDIO_EDIT_DIR = ROOT / "audio_edits"
@@ -393,14 +710,16 @@ AUDIO_SAVE_DIR = ROOT / "audio"
 AUDIO_SAVE_DIR.mkdir(exist_ok=True)
 
 # ── Internal API server URL ───────────────────────────────────────────────────
-# The trim drag-handle timeline and screen-recorder blob upload talk to a small
-# HTTP server on port 8502 that runs inside the same process as Streamlit.
-# On localhost this is always reachable.  On a VM or k8s pod set VIDFLOW_INTERNAL_HOST
-# to the hostname/IP that the *browser* can reach (e.g. the VM's LAN IP or a
-# NodePort hostname). Set VIDFLOW_INTERNAL_PORT if port 8502 is remapped.
-_INTERNAL_HOST = os.getenv("VIDFLOW_INTERNAL_HOST", "localhost")
+# The trim timeline and browser-recording uploads use a small HTTP server on port 8502.
+# Set VIDFLOW_INTERNAL_BASE_URL when a reverse proxy provides a same-origin HTTPS route.
+# Containers bind to 0.0.0.0; native installs default to loopback.
+_INTERNAL_HOST = os.getenv("VIDFLOW_INTERNAL_HOST", "").strip() or "localhost"
 _INTERNAL_PORT = int(os.getenv("VIDFLOW_INTERNAL_PORT", "8502"))
-_INTERNAL_BASE = f"http://{_INTERNAL_HOST}:{_INTERNAL_PORT}"
+_INTERNAL_BIND = os.getenv("VIDFLOW_INTERNAL_BIND", "127.0.0.1")
+_INTERNAL_BASE = os.getenv("VIDFLOW_INTERNAL_BASE_URL", "").strip().rstrip("/")
+if not _INTERNAL_BASE:
+    _INTERNAL_SCHEME = os.getenv("VIDFLOW_INTERNAL_SCHEME", "http").strip() or "http"
+    _INTERNAL_BASE = f"{_INTERNAL_SCHEME}://{_INTERNAL_HOST}:{_INTERNAL_PORT}"
 
 
 def _next_audio_name(directory: Path, suffix: str = ".mp3") -> Path:
@@ -501,6 +820,45 @@ def _ensure_servers(recordings_dir: str, uploads_dir: str):
 
         def do_POST(self):
             length = int(self.headers.get("Content-Length", 0))
+            if self.path == "/editor-upload":
+                allowed_extensions = {".webm", ".mp4", ".wav", ".mp3", ".m4a"}
+                filename = Path(self.headers.get("X-Filename", "")).name
+                if length <= 0 or length > 1_000_000_000:
+                    self.send_response(413)
+                    self._cors()
+                    self.end_headers()
+                    return
+                if Path(filename).suffix.lower() not in allowed_extensions:
+                    self.send_response(400)
+                    self._cors()
+                    self.end_headers()
+                    return
+                save_path = Path(state["uploads_dir"]) / filename
+                if save_path.exists():
+                    save_path = save_path.with_name(f"{save_path.stem}_{time.time_ns()}{save_path.suffix}")
+                remaining = length
+                try:
+                    with save_path.open("wb") as uploaded_file:
+                        while remaining:
+                            chunk = self.rfile.read(min(1024 * 1024, remaining))
+                            if not chunk:
+                                raise ConnectionError("Upload ended before all bytes arrived.")
+                            uploaded_file.write(chunk)
+                            remaining -= len(chunk)
+                except Exception:
+                    save_path.unlink(missing_ok=True)
+                    self.send_response(400)
+                    self._cors()
+                    self.end_headers()
+                    return
+                response = _json.dumps({"saved": save_path.name}).encode()
+                self.send_response(200)
+                self._cors()
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
+                return
             raw = self.rfile.read(length)
             if self.path == "/trim":
                 data = _json.loads(raw.decode())
@@ -528,13 +886,69 @@ def _ensure_servers(recordings_dir: str, uploads_dir: str):
                 self.wfile.write(f'{{"saved":"{save_path.name}"}}'.encode())
 
     try:
-        server = HTTPServer(("localhost", 8502), _Handler)
+        server = HTTPServer((_INTERNAL_BIND, _INTERNAL_PORT), _Handler)
         t = threading.Thread(target=server.serve_forever, daemon=True)
         t.start()
         state["started"] = True
     except OSError:
         state["started"] = True  # port already in use — old server still running
     return state
+
+
+def _editor_recorder_component(mode: str):
+        is_camera = mode == "camera"
+        html = """<!DOCTYPE html><html><head><style>
+body{font-family:'DM Sans','Segoe UI',sans-serif;background:#fafbf9;color:#202c29;margin:0;padding:12px;box-sizing:border-box}
+button{padding:9px 16px;border:0;border-radius:5px;font-size:13px;font-weight:600;cursor:pointer;margin-right:6px}
+#start{background:#1d6e5c;color:white}#stop{background:#e7ebe8;color:#496057}#stop.active{background:#d84f45;color:white}
+#status{color:#53635b;font-size:12px;margin:10px 0}#preview{width:100%;max-height:165px;display:none}
+#live{width:190px;height:120px;object-fit:cover;border:2px solid #e2e8e2;border-radius:5px;background:#192a29}
+#cameraBox{position:absolute;right:12px;bottom:12px;width:190px;display:none}
+body{position:relative;min-height:195px}
+</style></head><body>
+<button id="start">&#9679; Start recording</button><button id="stop">&#9632; Stop</button>
+<div id="status">Allow microphone access, then record your voice.</div>
+<div id="cameraBox"><video id="live" autoplay muted playsinline></video></div>
+<video id="preview" controls playsinline></video>
+<script>
+const CAMERA=__CAMERA__, PREFIX='__PREFIX__', BASE='__BASE__';
+const start=document.getElementById('start'),stop=document.getElementById('stop');
+const status=document.getElementById('status'),live=document.getElementById('live');
+const preview=document.getElementById('preview'),cameraBox=document.getElementById('cameraBox');
+let stream,recorder,chunks=[];
+start.onclick=async()=>{
+    try{
+        stream=await navigator.mediaDevices.getUserMedia(CAMERA
+            ?{video:{width:{ideal:640},height:{ideal:360}},audio:true}:{audio:true,video:false});
+        if(CAMERA){live.srcObject=stream;cameraBox.style.display='block';}
+        const mime=CAMERA?'video/webm;codecs=vp8,opus':'audio/webm;codecs=opus';
+        recorder=new MediaRecorder(stream,MediaRecorder.isTypeSupported(mime)?{mimeType:mime}:undefined);
+        chunks=[];
+        recorder.ondataavailable=event=>{if(event.data.size)chunks.push(event.data);};
+        recorder.onstop=async()=>{
+            const blob=new Blob(chunks,{type:CAMERA?'video/webm':'audio/webm'});
+            preview.src=URL.createObjectURL(blob);preview.style.display='block';
+            const filename=PREFIX+'_'+new Date().toISOString().replace(/[:.]/g,'-')+'.webm';
+            status.textContent='Saving recording to the editor…';
+            try{
+                const response=await fetch(BASE+'/editor-upload',{method:'POST',
+                    headers:{'X-Filename':filename,'Content-Type':blob.type},body:blob});
+                if(!response.ok)throw new Error('HTTP '+response.status);
+                const result=await response.json();
+                status.textContent='Saved '+result.saved+'. Click Refresh recordings in the editor.';
+            }catch(error){status.textContent='Save failed: '+error.message;}
+            stream.getTracks().forEach(track=>track.stop());
+            start.disabled=false;stop.classList.remove('active');
+        };
+        recorder.start(1000);start.disabled=true;stop.classList.add('active');
+        status.textContent='Recording…';
+    }catch(error){status.textContent='Could not start recording: '+error.message;}
+};
+stop.onclick=()=>{if(recorder&&recorder.state!=='inactive')recorder.stop();};
+</script></body></html>"""
+        return html.replace("__CAMERA__", str(is_camera).lower()).replace(
+                "__PREFIX__", "webcam_dub" if is_camera else "voice_dub"
+        ).replace("__BASE__", _INTERNAL_BASE)
 
 
 tab1, tab6, tab2, tab3, tab4, tab5, tab7 = st.tabs([
@@ -563,9 +977,13 @@ with tab1:
         if not script.strip():
             st.error("Enter a script first.")
             st.stop()
-        if style == "AI-generated scenes" and not os.getenv("GOOGLE_API_KEY"):
-            st.error("Set GOOGLE_API_KEY in .env to use AI-generated scenes.")
-            st.stop()
+        if style == "AI-generated scenes":
+            if scene_backend == "Gemini image model" and not os.getenv("GOOGLE_API_KEY"):
+                st.error("Set GOOGLE_API_KEY in .env to use Gemini image scenes.")
+                st.stop()
+            if scene_backend == "Ollama local storyboard" and not _ollama_available():
+                st.error(f"Ollama is not reachable at {get_ollama_base_url()}.")
+                st.stop()
         if style == "Stock footage" and not os.getenv("PEXELS_API_KEY"):
             st.error("Set PEXELS_API_KEY in .env to use stock footage.")
             st.stop()
@@ -593,16 +1011,25 @@ with tab1:
                     create_tts_offline(script.strip(), audio, speaking_rate=speaking_rate, voice_id=_offline_voice_id)
                 duration = _probe_duration(audio)
                 per_scene = duration / max(1, len(lines))
-                ai_client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY")) if style == "AI-generated scenes" else None
+                ai_client = (
+                    genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+                    if style == "AI-generated scenes" and scene_backend == "Gemini image model"
+                    else None
+                )
                 clips = []
                 credits = []
                 st.write(f"2/4 — Creating scenes ({style})")
                 for i, line in enumerate(lines):
                     if style == "AI-generated scenes":
                         still = folder / f"scene_{i:02d}.jpg"
-                        prompt = ("Cinematic technology documentary visual, realistic, clean composition, "
-                                  "no text, no letters, no logos, no watermark. Scene: " + line)
-                        generate_ai_image(ai_client, prompt, still)
+                        if scene_backend == "Gemini image model":
+                            prompt = ("Cinematic technology documentary visual, realistic, clean composition, "
+                                      "no text, no letters, no logos, no watermark. Scene: " + line)
+                            generate_ai_image(ai_client, prompt, still)
+                        else:
+                            from ollama_client import storyboard_scene_text
+                            scene_text = storyboard_scene_text(scene_ollama_model or "llama3.2", line)
+                            make_explainer_card(scene_text, still, i)
                         clip = folder / f"clip_{i:02d}.mp4"
                         image_to_clip(still, clip, per_scene)
                     elif style == "Animated explainer":
@@ -662,26 +1089,6 @@ with tab6:
 
     _an_gemini_ok = bool(os.getenv("GOOGLE_API_KEY"))
 
-    # Detect whether a local Ollama server is reachable
-    def _ollama_available():
-        try:
-            import urllib.request
-            urllib.request.urlopen("http://localhost:11434/api/tags", timeout=2)
-            return True
-        except Exception:
-            return False
-
-    # Fetch available Ollama models (cached per session to avoid repeated HTTP calls)
-    @st.cache_data(ttl=60)
-    def _ollama_models():
-        try:
-            import urllib.request, json as _j
-            with urllib.request.urlopen("http://localhost:11434/api/tags", timeout=3) as r:
-                data = _j.loads(r.read())
-            return [m["name"] for m in data.get("models", [])]
-        except Exception:
-            return []
-
     _an_ollama_ok = _ollama_available()
 
     # Backend selector — only show Ollama option when Gemini key is absent or both are available
@@ -695,19 +1102,23 @@ with tab6:
     elif _an_ollama_ok:
         an_backend = "Ollama (local)"
         st.info(
-            "\u2139\ufe0f **GOOGLE_API_KEY not set** \u2014 using local Ollama for narration. "
-            "For best results use a vision model such as `llava`, `moondream`, or `llava-llama3`."
+            f"\u2139\ufe0f **GOOGLE_API_KEY not set** \u2014 using Ollama at "
+            f"`{get_ollama_base_url()}`. Choose a vision model such as `llava`, `moondream`, "
+            "or `qwen2.5vl`."
         )
     else:
         an_backend = None
         st.warning(
             "\u26a0\ufe0f Neither **GOOGLE_API_KEY** (for Gemini) nor a running **Ollama** server "
-            "(http://localhost:11434) was detected. Set one of them to enable auto-narration. "
+            f"({get_ollama_base_url()}) was detected. Set one of them to enable auto-narration. "
+            "For Docker/Kubernetes, set OLLAMA_BASE_URL to an address reachable from the app container. "
             "The uploader is shown below so you can prepare the file in advance."
         )
 
     # Ollama model picker (only when Ollama backend is selected)
-    _VISION_KEYWORDS = ("llava", "moon", "bakllava", "vision", "minicpm-v", "llava-llama")
+    _VISION_KEYWORDS = (
+        "llava", "moon", "bakllava", "vision", "minicpm-v", "llava-llama", "qwen2.5vl", "qwen2-vl"
+    )
     if an_backend == "Ollama (local)":
         _om_list = _ollama_models()
         _vision_hint = [m for m in _om_list if any(k in m for k in _VISION_KEYWORDS)]
@@ -728,9 +1139,9 @@ with tab6:
     else:
         an_ollama_model = None
 
-    an_video = st.file_uploader(
+    an_video = _media_uploader(
         "Upload video (muted or with audio \u2014 only visuals are analysed)",
-        type=["mp4", "webm", "mov", "mkv", "avi"], key="an_upload"
+        ["mp4", "webm", "mov", "mkv", "avi"], key="an_upload", media_kind="video"
     )
 
     c_frames, c_ctx = st.columns([1, 2])
@@ -745,7 +1156,7 @@ with tab6:
         )
 
     if an_video:
-        st.video(an_video)
+        st.video(an_video.getvalue())
 
     if an_video and st.button(
         "\U0001f916 Analyse & write narration script",
@@ -799,40 +1210,18 @@ with tab6:
                     _script_text = _response.text.strip()
 
                 else:
-                    import base64, json as _j, urllib.request
+                    from ollama_client import narrate_frames
                     st.write(f"2/3 \u2014 Sending {len(frame_paths)} frames to Ollama ({an_ollama_model})\u2026")
-                    # Encode all frames as base64 JPEGs for the Ollama chat API
-                    _b64_imgs = []
-                    for fp in frame_paths:
-                        _b64_imgs.append(base64.b64encode(fp.read_bytes()).decode("ascii"))
-                    _payload = {
-                        "model": an_ollama_model,
-                        "messages": [{"role": "user", "content": _prompt, "images": _b64_imgs}],
-                        "stream": False,
-                    }
-                    _req = urllib.request.Request(
-                        "http://localhost:11434/api/chat",
-                        data=_j.dumps(_payload).encode(),
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
+                    _script_text = narrate_frames(
+                        an_ollama_model, [fp.read_bytes() for fp in frame_paths], _prompt
                     )
-                    with urllib.request.urlopen(_req, timeout=120) as _r:
-                        _resp_data = _j.loads(_r.read())
-                    _script_text = _resp_data["message"]["content"].strip()
 
                 st.write("3/3 \u2014 Script ready.")
                 an_status.update(label="Script ready!", state="complete", expanded=False)
                 st.session_state["an_script"] = _script_text
             except Exception as e:
                 an_status.update(label="Analysis failed", state="error")
-                _err_str = str(e)
-                if "400" in _err_str and an_backend == "Ollama (local)":
-                    st.error(
-                        f"HTTP 400 Bad Request from Ollama — **`{an_ollama_model}` does not support vision**. "
-                        "Run `ollama pull llava` or `ollama pull moondream` then select it above."
-                    )
-                else:
-                    st.error(_err_str)
+                st.error(str(e))
 
     if st.session_state.get("an_script"):
         edited_script = st.text_area(
@@ -861,7 +1250,9 @@ with tab2:
         "Leave a segment’s text blank to keep that portion silent."
     )
 
-    uploaded_video = st.file_uploader("Upload your video", type=["mp4", "webm", "mov", "mkv"])
+    uploaded_video = _media_uploader(
+        "Upload your video", ["mp4", "webm", "mov", "mkv"], "narration_video_upload"
+    )
 
     if uploaded_video is not None:
         # Save uploaded video to a persistent path so ffprobe and st.video() survive reruns
@@ -1148,7 +1539,10 @@ with tab2:
 # ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
 with tab3:
     st.subheader("Video editor")
-    ed_trim_tab, ed_merge_tab, ed_avsync_tab = st.tabs(["✂️ Trim", "\U0001f517 Merge", "\U0001f50a A/V Sync"])
+    ed_trim_tab, ed_merge_tab, ed_avsync_tab, ed_voice_tab, ed_url_tab, ed_webcam_tab, ed_overlay_tab = st.tabs([
+        "✂️ Trim", "\U0001f517 Merge", "\U0001f50a A/V Sync", "🎙 Self voice dubbing",
+        "🌐 URL video trim", "📷 Voice + webcam", "🖼 Video overlay",
+    ])
 
     # ── TRIM sub-tab ──────────────────────────────────────────────────────────
     with ed_trim_tab:
@@ -1157,9 +1551,9 @@ with tab3:
             "then set **Trim from / Trim to**. **Trim & save** cuts the clip and saves it "
             "to `trimmed_videos/`. You can also send trimmed files to the Merge tab."
         )
-        editor_clips = st.file_uploader(
-            "Upload videos to trim (up to 5)", type=["mp4", "webm", "mov", "mkv"],
-            accept_multiple_files=True, key="editor_upload"
+        editor_clips = _media_uploader(
+            "Upload videos to trim (up to 5)", ["mp4", "webm", "mov", "mkv"],
+            key="editor_upload", multiple=True
         )
 
         if editor_clips:
@@ -1314,9 +1708,9 @@ with tab3:
             "Upload videos to join (e.g. clips from the Trim tab, or any MP4/WebM). "
             "Use **\u2191 / \u2193** to set the playback order, then click **Merge**."
         )
-        merge_clips = st.file_uploader(
-            "Upload videos to merge", type=["mp4", "webm", "mov", "mkv"],
-            accept_multiple_files=True, key="merge_upload"
+        merge_clips = _media_uploader(
+            "Upload videos to merge", ["mp4", "webm", "mov", "mkv"],
+            key="merge_upload", multiple=True
         )
 
         if merge_clips:
@@ -1413,12 +1807,23 @@ with tab3:
             "Upload a **video** and an **audio file**. Choose whether to replace the video's "
             "audio entirely or mix with the existing track. Optionally delay the audio start."
         )
-        avsync_vid = st.file_uploader(
-            "Video file", type=["mp4", "webm", "mov", "mkv"], key="avs_vid"
+        avsync_vid = _media_uploader(
+            "Video file", ["mp4", "webm", "mov", "mkv"], key="avs_vid"
         )
-        avsync_aud = st.file_uploader(
-            "Audio file", type=["mp3", "wav", "m4a", "aac", "ogg", "flac"], key="avs_aud"
+        avsync_aud = _media_uploader(
+            "Audio file", ["mp3", "wav", "m4a", "aac", "ogg", "flac", "webm"],
+            key="avs_aud", media_kind="audio"
         )
+        library_recordings = sorted(VOICE_LIBRARY_DIR.glob("*.mp3"))
+        if library_recordings:
+            st.caption("Saved voice samples on this server are visible to anyone using this app.")
+            library_choice = st.selectbox(
+                "Or use a saved voice recording", [None, *library_recordings],
+                format_func=lambda path: path.stem if path else "Use uploaded audio",
+                key="avs_library_voice",
+            )
+            if library_choice:
+                avsync_aud = _ImportedMediaFile(library_choice)
 
         avs_c1, avs_c2 = st.columns(2)
         with avs_c1:
@@ -1434,9 +1839,71 @@ with tab3:
             )
 
         if avsync_vid:
-            st.video(avsync_vid)
+            st.video(avsync_vid.getvalue())
+            video_identity = (avsync_vid.name, avsync_vid.size)
+            if st.session_state.get("avs_preview_identity") != video_identity:
+                preview_dir = Path(tempfile.mkdtemp(prefix="avs_preview_"))
+                preview_path = preview_dir / Path(avsync_vid.name).name
+                preview_path.write_bytes(avsync_vid.getvalue())
+                try:
+                    st.session_state["avs_preview_duration"] = _probe_duration(preview_path)
+                    st.session_state["avs_preview_identity"] = video_identity
+                except ValueError as exc:
+                    st.warning(str(exc))
+                    st.session_state.pop("avs_preview_duration", None)
+            avs_video_duration = st.session_state.get("avs_preview_duration")
+            if avs_video_duration and avs_video_duration >= 0.1:
+                avs_range = st.slider(
+                    "Keep video range (s)", 0.0, float(avs_video_duration),
+                    (0.0, float(avs_video_duration)), step=0.1, key="avs_video_range",
+                )
+            else:
+                avs_range = None
+        else:
+            avs_range = None
+            avs_video_duration = None
         if avsync_aud:
-            st.audio(avsync_aud)
+            st.audio(avsync_aud.getvalue(), format="audio/webm" if avsync_aud.name.endswith(".webm") else "audio/mpeg")
+            audio_identity = (avsync_aud.name, avsync_aud.size)
+            if st.session_state.get("avs_audio_identity") != audio_identity:
+                audio_preview_dir = Path(tempfile.mkdtemp(prefix="avs_audio_preview_"))
+                audio_preview_path = audio_preview_dir / Path(avsync_aud.name).name
+                audio_preview_path.write_bytes(avsync_aud.getvalue())
+                try:
+                    st.session_state["avs_audio_duration"] = _probe_duration(audio_preview_path)
+                    st.session_state["avs_audio_identity"] = audio_identity
+                except ValueError as exc:
+                    st.warning(str(exc))
+                    st.session_state.pop("avs_audio_duration", None)
+        avs_audio_duration = st.session_state.get("avs_audio_duration") if avsync_aud else None
+        if avs_video_duration and avs_audio_duration and avs_offset + avs_audio_duration > 0:
+            selected_length = (avs_range[1] - avs_range[0]) if avs_range else avs_video_duration
+            target_length = avs_offset + avs_audio_duration
+            previous_range = st.session_state.get("avs_last_range")
+            if avs_range and previous_range is not None and avs_range != previous_range:
+                matched_speed = selected_length / target_length
+                if 0.5 <= matched_speed <= 2.0:
+                    st.session_state["avs_video_speed"] = round(matched_speed / 0.05) * 0.05
+            st.session_state["avs_last_range"] = avs_range
+            st.caption(
+                f"Video: {avs_video_duration:.1f}s (selected {selected_length:.1f}s) | "
+                f"Audio: {avs_audio_duration:.1f}s (starts at {avs_offset:.1f}s)"
+            )
+            if st.button("Match video length to audio", key="avs_match_length"):
+                matched_speed = selected_length / target_length
+                if 0.5 <= matched_speed <= 2.0:
+                    st.session_state["avs_video_speed"] = round(matched_speed / 0.05) * 0.05
+                else:
+                    st.warning("Matching requires speed outside 0.5x-2x. Adjust the video range or audio offset.")
+        if avsync_vid:
+            avs_speed = st.slider(
+                "Export video speed", 0.5, 2.0, 1.0, 0.05, key="avs_video_speed",
+                help="Changes the exported video duration; mixed original audio keeps its pitch.",
+            )
+            if avs_video_duration and avs_audio_duration:
+                st.caption(f"Expected export length: {max(selected_length / avs_speed, target_length):.1f}s")
+        else:
+            avs_speed = 1.0
 
         if avsync_vid and avsync_aud and st.button(
             "\U0001f50a Sync audio to video", type="primary",
@@ -1452,61 +1919,23 @@ with tab3:
 
                     avs_vid_dur = _probe_duration(avs_vid_path)
                     avs_aud_dur = _probe_duration(avs_aud_path)
-                    avs_final_dur = max(avs_vid_dur, avs_offset + avs_aud_dur)
                     avs_out = avs_folder / "avsync_out.mp4"
-
-                    avs_delay_ms = int(avs_offset * 1000)
-                    avs_extend = avs_final_dur > avs_vid_dur + 0.25
-
-                    if avs_mode == "Replace video audio":
-                        avs_filter = (
-                            f"[1:a]adelay={avs_delay_ms}|{avs_delay_ms},"
-                            f"apad=whole_dur={avs_final_dur:.3f}[aout]"
-                        )
-                        avs_a_map = "[aout]"
-                    else:
-                        avs_has_audio = bool(run([
-                            FFPROBE, "-v", "error", "-select_streams", "a",
-                            "-show_entries", "stream=index", "-of", "csv=p=0",
-                            str(avs_vid_path)
-                        ]).strip())
-                        if avs_has_audio:
-                            avs_filter = (
-                                f"[1:a]adelay={avs_delay_ms}|{avs_delay_ms}[new_a];"
-                                f"[0:a][new_a]amix=inputs=2:normalize=0:duration=longest,"
-                                f"apad=whole_dur={avs_final_dur:.3f}[aout]"
-                            )
-                        else:
-                            avs_filter = (
-                                f"[1:a]adelay={avs_delay_ms}|{avs_delay_ms},"
-                                f"apad=whole_dur={avs_final_dur:.3f}[aout]"
-                            )
-                            st.info("Source video has no audio — audio added without mixing.")
-                        avs_a_map = "[aout]"
-
-                    if avs_extend:
-                        extra_avs = avs_final_dur - avs_vid_dur + 0.1
-                        avs_filter += (
-                            f";[0:v]tpad=stop_mode=clone:stop_duration={extra_avs:.3f}[vout]"
-                        )
-                        avs_v_map = "[vout]"
-                        avs_cv = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "22"]
-                    else:
-                        avs_v_map = "0:v:0"
-                        avs_cv = ["-c:v", "copy"]
-
-                    run([
-                        FFMPEG, "-y",
-                        "-i", str(avs_vid_path),
-                        "-i", str(avs_aud_path),
-                        "-filter_complex", avs_filter,
-                        "-map", avs_v_map,
-                        "-map", avs_a_map,
-                        *avs_cv,
-                        "-c:a", "aac", "-b:a", "160k",
-                        "-movflags", "+faststart",
-                        str(avs_out),
-                    ])
+                    avs_has_audio = bool(run([
+                        FFPROBE, "-v", "error", "-select_streams", "a",
+                        "-show_entries", "stream=index", "-of", "csv=p=0", str(avs_vid_path)
+                    ]).strip())
+                    if avs_mode == "Mix with video audio" and not avs_has_audio:
+                        st.info("Source video has no audio, so the uploaded audio is used as its soundtrack.")
+                    run(build_audio_sync_command(
+                        avs_vid_path, avs_aud_path, avs_out, avs_vid_dur, avs_aud_dur,
+                        avs_offset,
+                        mode="mix" if avs_mode == "Mix with video audio" else "replace",
+                        source_has_audio=avs_has_audio,
+                        video_speed=avs_speed,
+                        trim_start=avs_range[0] if avs_range else 0.0,
+                        trim_end=avs_range[1] if avs_range else None,
+                    ))
+                    _validate_muxed_media(avs_out)
                     avs_status.update(label="A/V sync complete!", state="complete", expanded=False)
                     # Persist output path so download/save buttons survive reruns
                     st.session_state["avs_result"] = str(avs_out)
@@ -1531,6 +1960,341 @@ with tab3:
                 _avs_saved.write_bytes(st.session_state["avs_bytes"])
                 st.success(f"\u2713 Saved \u2192 `video+narrated/{_avs_saved.name}`")
 
+    # ── SELF VOICE DUBBING ────────────────────────────────────────────────────
+    with ed_voice_tab:
+        st.caption(
+            "Play the uploaded video, start recording, then speak along with it. "
+            "Use the start offset below if your recording starts after the video."
+        )
+        dub_video = _media_uploader(
+            "Video to dub", ["mp4", "webm", "mov", "mkv"], key="self_dub_video"
+        )
+        if dub_video:
+            st.video(dub_video.getvalue())
+            st.caption("Play the video above while recording your narration below.")
+        else:
+            st.info("Upload a video to preview it while recording your narration.")
+        components.html(_editor_recorder_component("audio"), height=215)
+        if st.button("Refresh voice recordings", key="refresh_voice_dubs"):
+            st.rerun()
+        voice_recordings = sorted(
+            [*UPLOADS_DIR.glob("voice_dub_*.webm"), *VOICE_LIBRARY_DIR.glob("*.mp3")],
+            key=lambda path: path.stat().st_mtime, reverse=True,
+        )
+        if voice_recordings:
+            selected_voice = st.selectbox(
+                "Recorded voice", voice_recordings, format_func=lambda path: path.name,
+                key="selected_voice_dub"
+            )
+            st.audio(selected_voice.read_bytes(), format="audio/mpeg" if selected_voice.suffix == ".mp3" else "audio/webm")
+            if selected_voice.suffix == ".webm" and st.button("Convert recording to MP3", key="voice_to_mp3"):
+                try:
+                    converted_dir = Path(tempfile.mkdtemp(prefix="voice_mp3_"))
+                    converted = _convert_recording_to_mp3(
+                        selected_voice, converted_dir / f"{selected_voice.stem}.mp3"
+                    )
+                    st.session_state["converted_voice_source"] = str(selected_voice)
+                    st.session_state["converted_voice_bytes"] = converted.read_bytes()
+                    st.session_state["converted_voice_name"] = converted.name
+                except Exception as exc:
+                    st.error(str(exc))
+            if st.session_state.get("converted_voice_source") == str(selected_voice):
+                st.audio(st.session_state["converted_voice_bytes"], format="audio/mpeg")
+                st.download_button(
+                    "Download MP3", st.session_state["converted_voice_bytes"],
+                    st.session_state["converted_voice_name"], "audio/mpeg", key="download_recorded_mp3",
+                )
+                voice_label = st.text_input(
+                    "Name this voice recording", value=selected_voice.stem, key="voice_library_label"
+                )
+                st.caption("Saved voice samples are accessible to anyone using this app. This stores recordings; it does not clone or isolate voices.")
+                if st.button("Save recording to voice library", key="save_voice_library"):
+                    safe_label = re.sub(r"[^a-zA-Z0-9_-]+", "_", voice_label).strip("_")[:64]
+                    if not safe_label:
+                        st.error("Enter a name for the recording.")
+                    else:
+                        library_path = VOICE_LIBRARY_DIR / f"{safe_label}.mp3"
+                        if library_path.exists():
+                            st.error("A recording with that name already exists.")
+                        else:
+                            library_path.write_bytes(st.session_state["converted_voice_bytes"])
+                            st.success(f"Saved to voice_library/{library_path.name}")
+            dub_offset = st.number_input("Voice start offset (s)", 0.0, 9999.0, 0.0, 0.5, key="voice_dub_offset")
+            dub_mode = st.radio(
+                "Audio mix", ["Replace original audio", "Mix with original audio"],
+                horizontal=True, key="voice_dub_mode"
+            )
+            if dub_video and st.button("Create dubbed video", type="primary", key="create_voice_dub"):
+                with st.status("Creating dubbed video…", expanded=True) as dub_status:
+                    try:
+                        dub_dir = Path(tempfile.mkdtemp(prefix="vidflow_voice_dub_"))
+                        source_path = dub_dir / Path(dub_video.name).name
+                        source_path.write_bytes(dub_video.getvalue())
+                        video_duration = _probe_duration(source_path)
+                        voice_duration = _probe_duration(selected_voice)
+                        source_has_audio = bool(run([
+                            FFPROBE, "-v", "error", "-select_streams", "a",
+                            "-show_entries", "stream=index", "-of", "csv=p=0", str(source_path)
+                        ]).strip())
+
+                        if dub_mode == "Mix with original audio" and not source_has_audio:
+                            st.info("The source video has no audio, so the recorded voice is used as its soundtrack.")
+
+                        dubbed_output = dub_dir / "self_voice_dub.mp4"
+                        run(build_audio_sync_command(
+                            source_path, selected_voice, dubbed_output, video_duration,
+                            voice_duration, dub_offset,
+                            mode="mix" if dub_mode == "Mix with original audio" else "replace",
+                            source_has_audio=source_has_audio,
+                        ))
+                        _validate_muxed_media(dubbed_output)
+                        st.session_state["voice_dub_bytes"] = dubbed_output.read_bytes()
+                        st.session_state["voice_dub_name"] = _next_edit_name(COMPOSITE_DIR).name
+                        dub_status.update(label="Voice dubbing complete", state="complete", expanded=False)
+                    except Exception as exc:
+                        dub_status.update(label="Voice dubbing failed", state="error")
+                        st.error(str(exc))
+        else:
+            st.info("Record your voice above, then refresh the recordings list to select it.")
+
+        if st.session_state.get("voice_dub_bytes"):
+            st.success("Dubbed video is ready. Download it or save it to a folder.")
+            st.video(st.session_state["voice_dub_bytes"])
+            voice_dl, voice_composite_save, voice_save = st.columns(3)
+            voice_dl.download_button(
+                "Download dubbed video", st.session_state["voice_dub_bytes"],
+                st.session_state["voice_dub_name"], "video/mp4", key="voice_dub_download",
+                use_container_width=True,
+            )
+            if voice_composite_save.button(
+                "Save to video_webcam_overlay/", key="voice_dub_composite_save", use_container_width=True
+            ):
+                saved_composite = _next_edit_name(COMPOSITE_DIR)
+                saved_composite.write_bytes(st.session_state["voice_dub_bytes"])
+                st.success(f"Saved to video_webcam_overlay/{saved_composite.name}")
+            if voice_save.button("Save to video+narrated/", key="voice_dub_save", use_container_width=True):
+                saved_voice = _next_edit_name(NARRATED_DIR)
+                saved_voice.write_bytes(st.session_state["voice_dub_bytes"])
+                st.success(f"Saved to video+narrated/{saved_voice.name}")
+
+    # ── URL VIDEO TRIM ───────────────────────────────────────────────────────
+    with ed_url_tab:
+        st.caption(
+            "Preview a Drive or YouTube link in your browser, or load a downloadable video to trim it. "
+            "Private Drive playback may use your browser sign-in; importing for trim requires server-accessible media."
+        )
+        video_url_input = st.text_input(
+            "Video URL", placeholder="https://www.youtube.com/watch?v=...", key="url_trim_input"
+        )
+        youtube_permission = st.checkbox(
+            "I own this video or have permission to download it", key="url_trim_permission"
+        )
+        preview_col, load_col = st.columns(2)
+        with preview_col:
+            if st.button("Preview URL in application", key="preview_video_url"):
+                try:
+                    preview_kind, preview_url = browser_video_preview_url(video_url_input)
+                    st.session_state["url_video_preview"] = (video_url_input, preview_kind, preview_url)
+                except Exception as exc:
+                    st.error(str(exc))
+        with load_col:
+            load_video_url = st.button("Load video URL", type="primary", key="load_video_url")
+        if load_video_url:
+            imported_path = _next_edit_name(UPLOADS_DIR, suffix=".mp4")
+            try:
+                if _url_parse(video_url_input).hostname in {
+                    "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"
+                }:
+                    if not youtube_permission:
+                        raise ValueError("Confirm that you have permission to download this YouTube video.")
+                    download_authorized_youtube_video(video_url_input, imported_path)
+                else:
+                    _download_direct_video_url(video_url_input, imported_path)
+                video_stream = run([
+                    FFPROBE, "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=index", "-of", "csv=p=0", str(imported_path)
+                ])
+                if not video_stream:
+                    raise ValueError("The downloaded file does not contain a video stream.")
+                st.session_state["url_trim_path"] = str(imported_path)
+                st.session_state["url_trim_duration"] = _probe_duration(imported_path)
+            except Exception as exc:
+                imported_path.unlink(missing_ok=True)
+                st.error(str(exc))
+
+        url_preview = st.session_state.get("url_video_preview")
+        if url_preview and url_preview[0] == video_url_input:
+            if url_preview[1] in {"youtube", "drive"}:
+                st.iframe(url_preview[2], height=480)
+                st.link_button("Open video preview in a new tab", url_preview[2])
+                if url_preview[1] == "drive":
+                    st.caption("Google may ask you to sign in here. Browser playback does not grant VidFlow server access for trimming.")
+            else:
+                st.video(url_preview[2])
+
+        url_trim_path = Path(st.session_state["url_trim_path"]) if st.session_state.get("url_trim_path") else None
+        if url_trim_path and url_trim_path.exists():
+            url_duration = float(st.session_state["url_trim_duration"])
+            st.video(str(url_trim_path))
+            trim_start, trim_end = st.columns(2)
+            with trim_start:
+                url_start = st.number_input("Trim from (s)", 0.0, url_duration, 0.0, 0.5, key="url_trim_start")
+            with trim_end:
+                url_end = st.number_input("Trim to (s)", 0.0, url_duration, url_duration, 0.5, key="url_trim_end")
+            if st.button("Trim URL video", type="primary", key="trim_url_video"):
+                if url_start >= url_end:
+                    st.error("Trim from must be less than Trim to.")
+                else:
+                    try:
+                        trimmed_output = _next_edit_name(TRIMMED_DIR)
+                        run([
+                            FFMPEG, "-y", "-ss", str(url_start), "-i", str(url_trim_path),
+                            "-t", str(url_end - url_start), "-c:v", "libx264",
+                            "-preset", "veryfast", "-crf", "22", "-c:a", "aac",
+                            "-b:a", "160k", "-movflags", "+faststart", str(trimmed_output),
+                        ])
+                        st.session_state["url_trim_result"] = trimmed_output.read_bytes()
+                        st.session_state["url_trim_result_name"] = trimmed_output.name
+                        st.success(f"Trimmed video saved to trimmed_videos/{trimmed_output.name}")
+                    except Exception as exc:
+                        st.error(str(exc))
+        if st.session_state.get("url_trim_result"):
+            st.video(st.session_state["url_trim_result"])
+            st.download_button(
+                "Download trimmed video", st.session_state["url_trim_result"],
+                st.session_state["url_trim_result_name"], "video/mp4", key="url_trim_download"
+            )
+
+    # ── VOICE + WEBCAM DUBBING ───────────────────────────────────────────────
+    with ed_webcam_tab:
+        st.caption(
+            "Record your camera and microphone, then place the camera video in a small "
+            "lower-right box over your main video. The recorded voice can replace the original soundtrack."
+        )
+        webcam_base = _media_uploader(
+            "Main video", ["mp4", "webm", "mov", "mkv"], key="webcam_base_video"
+        )
+        if webcam_base:
+            st.video(webcam_base.getvalue())
+            st.caption("Play the main video above while recording your camera and narration below.")
+        components.html(_editor_recorder_component("camera"), height=235)
+        if st.button("Refresh webcam recordings", key="refresh_webcam_dubs"):
+            st.rerun()
+        webcam_recordings = sorted(UPLOADS_DIR.glob("webcam_dub_*.webm"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if webcam_recordings:
+            selected_webcam = st.selectbox(
+                "Camera + voice recording", webcam_recordings,
+                format_func=lambda path: path.name, key="selected_webcam_dub"
+            )
+            webcam_size = st.slider("Camera box width", 10, 50, 25, 5, format="%d%%", key="webcam_box_size")
+            webcam_audio = st.radio(
+                "Soundtrack", ["Use recorded microphone", "Keep main video audio"],
+                horizontal=True, key="webcam_audio_source"
+            )
+            if webcam_base and st.button("Create webcam-dubbed video", type="primary", key="create_webcam_dub"):
+                try:
+                    webcam_dir = Path(tempfile.mkdtemp(prefix="vidflow_webcam_dub_"))
+                    base_path = webcam_dir / Path(webcam_base.name).name
+                    base_path.write_bytes(webcam_base.getvalue())
+                    webcam_output = webcam_dir / "webcam_dub.mp4"
+                    webcam_command = build_video_overlay_command(
+                        base_path, selected_webcam, webcam_output,
+                        size=webcam_size / 100, position="bottom-right",
+                        audio_source="overlay" if webcam_audio == "Use recorded microphone" else "base",
+                    )
+                    run(webcam_command)
+                    if webcam_audio == "Use recorded microphone":
+                        _validate_muxed_media(webcam_output)
+                    st.session_state["webcam_dub_bytes"] = webcam_output.read_bytes()
+                    st.session_state["webcam_dub_name"] = "webcam_dub.mp4"
+                    st.success("Webcam-dubbed video is ready. Download it or save it to a folder.")
+                except Exception as exc:
+                    st.error(str(exc))
+        elif not webcam_base:
+            st.info("Upload your main video, then record a webcam and microphone clip.")
+        if st.session_state.get("webcam_dub_bytes"):
+            st.video(st.session_state["webcam_dub_bytes"])
+            webcam_dl, webcam_composite_save, webcam_save = st.columns(3)
+            webcam_dl.download_button(
+                "Download webcam-dubbed video", st.session_state["webcam_dub_bytes"],
+                st.session_state["webcam_dub_name"], "video/mp4", key="webcam_dub_download",
+                use_container_width=True,
+            )
+            if webcam_composite_save.button(
+                "Save to video_webcam_overlay/", key="webcam_dub_composite_save", use_container_width=True
+            ):
+                saved_composite = _next_edit_name(COMPOSITE_DIR)
+                saved_composite.write_bytes(st.session_state["webcam_dub_bytes"])
+                st.success(f"Saved to video_webcam_overlay/{saved_composite.name}")
+            if webcam_save.button("Save to video+narrated/", key="webcam_dub_save", use_container_width=True):
+                saved_webcam = _next_edit_name(NARRATED_DIR)
+                saved_webcam.write_bytes(st.session_state["webcam_dub_bytes"])
+                st.success(f"Saved to video+narrated/{saved_webcam.name}")
+
+    # ── VIDEO OVERLAY ────────────────────────────────────────────────────────
+    with ed_overlay_tab:
+        st.caption("Place a second video over the main video. Choose its corner, size, and soundtrack.")
+        overlay_base = _media_uploader(
+            "Full-screen video", ["mp4", "webm", "mov", "mkv"], key="overlay_base_video"
+        )
+        overlay_clip = _media_uploader(
+            "Video to place on top", ["mp4", "webm", "mov", "mkv"], key="overlay_clip_video"
+        )
+        overlay_options, overlay_audio_options = st.columns(2)
+        with overlay_options:
+            overlay_size = st.slider("Overlay width", 10, 50, 25, 5, format="%d%%", key="video_overlay_size")
+            overlay_position = st.selectbox(
+                "Overlay position", ["bottom-right", "bottom-left", "top-right", "top-left"],
+                format_func=lambda value: value.replace("-", " ").title(), key="video_overlay_position"
+            )
+        with overlay_audio_options:
+            overlay_audio = st.selectbox(
+                "Soundtrack", ["Keep full-screen video audio", "Use overlay video audio", "Mute"],
+                key="video_overlay_audio"
+            )
+        if overlay_base and overlay_clip and st.button(
+            "Create picture-in-picture video", type="primary", key="create_video_overlay"
+        ):
+            try:
+                overlay_dir = Path(tempfile.mkdtemp(prefix="vidflow_overlay_"))
+                base_path = overlay_dir / Path(overlay_base.name).name
+                clip_path = overlay_dir / Path(overlay_clip.name).name
+                base_path.write_bytes(overlay_base.getvalue())
+                clip_path.write_bytes(overlay_clip.getvalue())
+                overlay_output = overlay_dir / "picture_in_picture.mp4"
+                audio_source = {
+                    "Keep full-screen video audio": "base",
+                    "Use overlay video audio": "overlay",
+                    "Mute": "none",
+                }[overlay_audio]
+                run(build_video_overlay_command(
+                    base_path, clip_path, overlay_output,
+                    size=overlay_size / 100, position=overlay_position, audio_source=audio_source,
+                ))
+                st.session_state["video_overlay_bytes"] = overlay_output.read_bytes()
+                st.session_state["video_overlay_name"] = "picture_in_picture.mp4"
+                st.success("Picture-in-picture video is ready. Download it or save it to a folder.")
+            except Exception as exc:
+                st.error(str(exc))
+        if st.session_state.get("video_overlay_bytes"):
+            st.video(st.session_state["video_overlay_bytes"])
+            overlay_dl, overlay_composite_save, overlay_save = st.columns(3)
+            overlay_dl.download_button(
+                "Download picture-in-picture video", st.session_state["video_overlay_bytes"],
+                st.session_state["video_overlay_name"], "video/mp4", key="video_overlay_download",
+                use_container_width=True,
+            )
+            if overlay_composite_save.button(
+                "Save to video_webcam_overlay/", key="video_overlay_composite_save", use_container_width=True
+            ):
+                saved_composite = _next_edit_name(COMPOSITE_DIR)
+                saved_composite.write_bytes(st.session_state["video_overlay_bytes"])
+                st.success(f"Saved to video_webcam_overlay/{saved_composite.name}")
+            if overlay_save.button("Save to video+narrated/", key="video_overlay_save", use_container_width=True):
+                saved_overlay = _next_edit_name(NARRATED_DIR)
+                saved_overlay.write_bytes(st.session_state["video_overlay_bytes"])
+                st.success(f"Saved to video+narrated/{saved_overlay.name}")
+
 # ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
 # TAB 4 — Transcript: video → text via faster-whisper (offline)
 # ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
@@ -1554,9 +2318,9 @@ with tab4:
             "then restart the app."
         )
     else:
-        trans_video = st.file_uploader(
-            "Upload video or audio", type=["mp4", "webm", "mov", "mkv", "mp3", "wav", "m4a"],
-            key="trans_upload"
+        trans_video = _media_uploader(
+            "Upload video or audio", ["mp4", "webm", "mov", "mkv", "mp3", "wav", "m4a"],
+            key="trans_upload", media_kind="media"
         )
         col_m, col_lang = st.columns(2)
         with col_m:
@@ -1729,7 +2493,10 @@ startBtn.addEventListener('click',async()=>{
   try{
     // audio:true in getDisplayMedia shows the "Share with tab audio" toggle to the user.
     // If they turn it OFF in the browser dialog, disp will have no audio tracks — respected.
-    const disp=await navigator.mediaDevices.getDisplayMedia({video:{frameRate:30},audio:true});
+        const disp=await navigator.mediaDevices.getDisplayMedia({
+            video:{width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:30}},audio:true
+        });
+        const capture=disp.getVideoTracks()[0].getSettings();
     const tracks=[...disp.getTracks()];
 
     // Only request microphone if the user explicitly checked the box
@@ -1746,7 +2513,7 @@ startBtn.addEventListener('click',async()=>{
     chunks=[];
     const mime=MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
       ?'video/webm;codecs=vp9,opus':'video/webm';
-    recorder=new MediaRecorder(stream,{mimeType:mime});
+    recorder=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:8000000});
     recorder.ondataavailable=e=>{if(e.data.size>0)chunks.push(e.data);};
 
     recorder.onstop=()=>{
@@ -1783,7 +2550,8 @@ startBtn.addEventListener('click',async()=>{
     stopBtn.classList.add('active');
     dlWrap.style.display='none';
     preview.style.display='none';
-    statusMsg.textContent='Recording in progress\u2026 Press Stop or close the share dialog to finish.';
+        statusMsg.textContent='Recording '+capture.width+' × '+capture.height+' at up to '+
+            Math.round(capture.frameRate||30)+' fps. Press Stop or close the share dialog to finish.';
   }catch(err){
     statusMsg.textContent='Could not start: '+err.message;
   }
@@ -1804,29 +2572,13 @@ stopBtn.addEventListener('click',stopRecording);
 </script></body></html>
 """.replace("__INTERNAL_BASE__", _INTERNAL_BASE), height=560)
 
-    # Saved recordings list (refreshes on each rerun)
-    saved_recordings = sorted(RECORDINGS_DIR.glob("*.*"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if saved_recordings:
-        st.markdown("**Saved recordings**")
-        for rec in saved_recordings[:15]:
-            with st.expander(f"▶ {rec.name}  — {rec.stat().st_size // 1024:,} KB", expanded=False):
-                st.video(str(rec))
-                st.download_button(
-                    "⬇ Download", rec.read_bytes(), rec.name,
-                    use_container_width=True, key=f"dl_{rec.name}"
-                )
-    else:
-        st.info("No recordings yet. Start a recording above — it will auto-save here when you stop.")
-
-    st.caption("Recordings are also available in **Upload video + narrate** and **Video editor** tabs.")
-
 # ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
 # TAB 7 — Audio editor: TTS, Trim audio, Merge audio
 # ――――――――――――――――――――――――――――――――――――――――――――――――――――――――――――
 with tab7:
     st.subheader("Audio editor")
-    ae_tts_tab, ae_trim_tab, ae_merge_tab = st.tabs([
-        "\U0001f4ac Text \u2192 Audio", "\u2702\ufe0f Trim audio", "\U0001f517 Merge audio"
+    ae_tts_tab, ae_trim_tab, ae_merge_tab, ae_lipsync_tab = st.tabs([
+        "\U0001f4ac Text \u2192 Audio", "\u2702\ufe0f Trim audio", "\U0001f517 Merge audio", "Lip sync"
     ])
 
     # ── Text → Audio sub-tab ──────────────────────────────────────────────────
@@ -1919,9 +2671,9 @@ with tab7:
             "Upload an audio file, set the **Start** and **End** trim points, "
             "then click **Trim & save**. Output saved to `audio_edits/`."
         )
-        ae_trim_file = st.file_uploader(
-            "Audio file to trim", type=["mp3", "wav", "m4a", "aac", "ogg", "flac"],
-            key="ae_trim_upload"
+        ae_trim_file = _media_uploader(
+            "Audio file to trim", ["mp3", "wav", "m4a", "aac", "ogg", "flac"],
+            key="ae_trim_upload", media_kind="audio"
         )
         if ae_trim_file:
             ae_trim_folder = Path(tempfile.mkdtemp(prefix="ttv_aetrim_"))
@@ -1984,9 +2736,9 @@ with tab7:
             "Upload audio files, use **\u2191 / \u2193** to set playback order, "
             "then click **Merge**. All files are re-encoded to a common format before joining."
         )
-        ae_merge_files = st.file_uploader(
-            "Audio files to merge", type=["mp3", "wav", "m4a", "aac", "ogg", "flac"],
-            accept_multiple_files=True, key="ae_merge_upload"
+        ae_merge_files = _media_uploader(
+            "Audio files to merge", ["mp3", "wav", "m4a", "aac", "ogg", "flac"],
+            key="ae_merge_upload", media_kind="audio", multiple=True
         )
 
         if ae_merge_files:
@@ -2070,3 +2822,114 @@ with tab7:
                     st.success(f"\u2713 Saved \u2192 `audio/{_am_sv_path.name}`")
         else:
             st.info("Upload two or more audio files above to merge them.")
+
+    with ae_lipsync_tab:
+        st.caption(
+            "Animate mouth movements in a short 720p/1080p video using a separate audio track. "
+            "Kling LipSync via fal processes the media in the cloud and may incur charges."
+        )
+        has_fal_key = bool(os.getenv("FAL_KEY"))
+        if not has_fal_key:
+            st.warning("Set FAL_KEY on the VidFlow server to enable cloud lip sync.")
+            st.info(
+                "No-key alternative: create a local dubbed video (audio replacement without mouth animation)."
+            )
+        lipsync_video = _media_uploader("Face video (MP4/MOV/WebM, 2-10s, max 100 MB)",
+                                        ["mp4", "mov", "webm"], key="ae_lipsync_video",
+                                        max_upload_size=100)
+        lipsync_audio = _media_uploader("Speech audio (2-60s, max 5 MB)",
+                                        ["mp3", "wav", "ogg", "m4a", "aac"],
+                                        key="ae_lipsync_audio", media_kind="audio",
+                                        max_upload_size=5)
+        if lipsync_video:
+            st.video(lipsync_video.getvalue(), format=lipsync_video.type or "video/webm")
+        if lipsync_audio:
+            st.audio(lipsync_audio.getvalue())
+        lipsync_consent = st.checkbox(
+            "I have the subject's consent and agree to send this video and audio to fal for processing",
+            key="ae_lipsync_consent",
+        )
+        if has_fal_key and st.button("Generate lip-synced video", type="primary", key="ae_lipsync_btn",
+                         disabled=not (lipsync_video and lipsync_audio and lipsync_consent)):
+            with st.status("Generating lip sync...", expanded=True) as lipsync_status:
+                try:
+                    import json as _json
+                    from lipsync_client import prepare_lipsync_video, run_kling_lipsync
+
+                    lipsync_folder = Path(tempfile.mkdtemp(prefix="ttv_lipsync_"))
+                    uploaded_video_path = lipsync_folder / f"upload{Path(lipsync_video.name).suffix.lower()}"
+                    audio_path = lipsync_folder / f"speech{Path(lipsync_audio.name).suffix.lower()}"
+                    uploaded_video_path.write_bytes(lipsync_video.getvalue())
+                    audio_path.write_bytes(lipsync_audio.getvalue())
+                    if uploaded_video_path.stat().st_size > 100_000_000:
+                        raise ValueError("Lip sync video uploads must be under 100 MB.")
+                    video_path = prepare_lipsync_video(
+                        uploaded_video_path, lipsync_folder / "source.mp4", FFMPEG
+                    )
+                    video_metadata = _json.loads(run([
+                        FFPROBE, "-v", "error", "-select_streams", "v:0",
+                        "-show_entries", "stream=width,height", "-of", "json", str(video_path),
+                    ]))
+                    video_streams = video_metadata.get("streams", [])
+                    if not video_streams:
+                        raise ValueError("The uploaded video has no playable video stream.")
+                    dimensions = (video_streams[0]["width"], video_streams[0]["height"])
+                    output_url = run_kling_lipsync(
+                        video_path, audio_path, _probe_duration(video_path),
+                        _probe_duration(audio_path), dimensions,
+                    )
+                    output_path = lipsync_folder / "lip_synced.mp4"
+                    _download_direct_video_url(output_url, output_path, max_bytes=200_000_000)
+                    _validate_muxed_media(output_path)
+                    st.session_state["ae_lipsync_bytes"] = output_path.read_bytes()
+                    lipsync_status.update(label="Lip sync ready", state="complete", expanded=False)
+                except Exception as exc:
+                    lipsync_status.update(label="Lip sync failed", state="error")
+                    st.error(str(exc))
+
+        if (not has_fal_key) and st.button(
+            "Create local dubbed video (no API key)",
+            type="primary",
+            key="ae_local_dub_btn",
+            disabled=not (lipsync_video and lipsync_audio and lipsync_consent),
+        ):
+            with st.status("Creating local dubbed video...", expanded=True) as local_dub_status:
+                try:
+                    from lipsync_client import prepare_lipsync_video
+
+                    local_folder = Path(tempfile.mkdtemp(prefix="ttv_local_dub_"))
+                    uploaded_video_path = local_folder / f"upload{Path(lipsync_video.name).suffix.lower()}"
+                    audio_path = local_folder / f"speech{Path(lipsync_audio.name).suffix.lower()}"
+                    uploaded_video_path.write_bytes(lipsync_video.getvalue())
+                    audio_path.write_bytes(lipsync_audio.getvalue())
+                    video_path = prepare_lipsync_video(uploaded_video_path, local_folder / "source.mp4", FFMPEG)
+                    video_duration = _probe_duration(video_path)
+                    audio_duration = _probe_duration(audio_path)
+                    source_audio = run([
+                        FFPROBE, "-v", "error", "-select_streams", "a:0",
+                        "-show_entries", "stream=codec_type", "-of", "csv=p=0", str(video_path),
+                    ])
+                    source_has_audio = bool(source_audio.strip())
+
+                    output_path = local_folder / "local_dub.mp4"
+                    run(build_audio_sync_command(
+                        video_path,
+                        audio_path,
+                        output_path,
+                        video_duration,
+                        audio_duration,
+                        0.0,
+                        mode="replace",
+                        source_has_audio=source_has_audio,
+                    ))
+                    _validate_muxed_media(output_path)
+                    st.session_state["ae_lipsync_bytes"] = output_path.read_bytes()
+                    local_dub_status.update(label="Local dubbed video ready", state="complete", expanded=False)
+                except Exception as exc:
+                    local_dub_status.update(label="Local dubbing failed", state="error")
+                    st.error(str(exc))
+
+        if st.session_state.get("ae_lipsync_bytes"):
+            st.video(st.session_state["ae_lipsync_bytes"])
+            st.download_button("Download lip-synced MP4", st.session_state["ae_lipsync_bytes"],
+                               "lip_synced.mp4", "video/mp4", key="ae_lipsync_download")

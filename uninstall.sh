@@ -79,23 +79,8 @@ if [[ "$CHOICE" == "1" || "$CHOICE" == "3" ]]; then
     echo ""
     echo "[VM] Removing VM installation..."
 
-    # Stop running VidFlow process
-    if [[ -f "vidflow.pid" ]]; then
-        PID=$(cat vidflow.pid 2>/dev/null || echo "")
-        if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
-            echo "[INFO] Stopping VidFlow (PID $PID)..."
-            kill "$PID" && sleep 1 || true
-        fi
-        rm -f vidflow.pid
-        echo "[INFO] PID file removed."
-    fi
-
-    # Also stop any orphan Streamlit processes
-    if pgrep -f "streamlit run app.py" &>/dev/null; then
-        echo "[INFO] Stopping orphaned streamlit processes..."
-        pkill -f "streamlit run app.py" || true
-        sleep 1
-    fi
+    # Stop only the VidFlow instance tracked by this project's PID file.
+    ./stop_app.sh || true
 
     # Remove virtual environment
     read -rp "  Remove .venv (Python packages)? [y/N]: " RM_VENV
@@ -122,9 +107,9 @@ if [[ "$CHOICE" == "1" || "$CHOICE" == "3" ]]; then
     read -rp "  Remove all generated media (audio/, video+narrated/, etc.)? [y/N]: " RM_MEDIA
     RM_MEDIA="${RM_MEDIA:-N}"
     if [[ "${RM_MEDIA,,}" == "y" ]]; then
-        rm -rf audio/* audio_edits/* screen_recordings/* \
+        rm -rf audio/* audio_edits/* voice_library/* screen_recordings/* \
                 trimmed_videos/* merged_videos/* \
-                "video+narrated/"* uploads/* 2>/dev/null || true
+                "video+narrated/"* video_webcam_overlay/* uploads/* 2>/dev/null || true
         echo "[INFO] Media output directories cleared."
     fi
 
@@ -140,4 +125,5 @@ echo "============================================================"
 echo ""
 echo " Source code directory: $SCRIPT_DIR"
 echo " To remove it entirely: rm -rf \"$SCRIPT_DIR\""
+echo " Ollama and its downloaded models were not removed."
 echo ""

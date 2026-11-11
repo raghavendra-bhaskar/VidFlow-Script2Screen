@@ -114,6 +114,14 @@ echo.
 echo  Stop the app:
 echo    stop_app.bat
 echo.
+echo  Uninstall the VM install:
+echo    uninstall.bat
+echo.
+echo  Ollama auto-narration:
+echo    Install Ollama separately and pull a vision model, e.g. ollama pull llava:7b
+echo    Same machine: OLLAMA_BASE_URL=http://localhost:11434 in .env
+echo    Kubernetes: set OLLAMA_BASE_URL to the VM private address in k8s/deployment.yaml
+echo.
 echo  Open: https://!CERT_DOMAIN!:8501
 echo  (Accept the self-signed certificate warning on first visit.)
 echo.
@@ -255,6 +263,8 @@ echo    kubectl -n !K8S_NS! logs deploy/vidflow -f
 echo.
 echo  Access (once DNS points to Ingress LoadBalancer IP):
 echo    https://!K8S_DOMAIN!
+echo  Use the Ingress URL (without :30501) for browser recording and editor uploads.
+echo  Ollama must be reachable from the VidFlow pod; see README.md, Tab 6.
 echo.
 echo  Update after a code change:
 echo    !BUILD_CMD! build -t !IMAGE_NAME! .

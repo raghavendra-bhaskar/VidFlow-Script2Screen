@@ -8,12 +8,15 @@ cd "$SCRIPT_DIR"
 PID_FILE="vidflow.pid"
 
 if [[ ! -f "$PID_FILE" ]]; then
-    echo "[WARN] vidflow.pid not found — trying to find Streamlit process by name..."
-    pkill -f "streamlit run app.py" 2>/dev/null && echo "[INFO] Stopped." || echo "[WARN] No running VidFlow process found."
+    echo "[WARN] vidflow.pid not found — no process was stopped to avoid affecting other Python apps."
     exit 0
 fi
 
 PID=$(cat "$PID_FILE")
+if [[ ! "$PID" =~ ^[0-9]+$ ]]; then
+    echo "[ERROR] Invalid PID in ${PID_FILE}; remove the stale file after checking the process manually."
+    exit 1
+fi
 
 if kill -0 "$PID" 2>/dev/null; then
     echo "[INFO] Stopping VidFlow (PID ${PID})..."

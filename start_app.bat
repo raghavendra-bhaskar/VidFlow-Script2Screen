@@ -6,7 +6,7 @@
 ::   set PORT=8080 & start_app.bat  (custom port)
 ::   set NO_SSL=1  & start_app.bat  (plain HTTP, for behind IIS/nginx)
 ::
-:: Writes PID to vidflow.pid so stop_app.bat can cleanly kill it.
+:: Writes the exact Streamlit PID to vidflow.pid so stop_app.bat can stop its process tree.
 setlocal enabledelayedexpansion
 title VidFlow Text-to-Video AI
 
@@ -25,6 +25,11 @@ if exist ".env" (
 
 set "APP_PORT=%PORT%"
 if "%APP_PORT%"=="" set "APP_PORT=8501"
+
+if exist "vidflow.pid" (
+    echo [WARN] vidflow.pid already exists. Run stop_app.bat first, or remove it if the process is gone.
+    exit /b 1
+)
 
 set "PYTHON=%ROOT%.venv\Scripts\python.exe"
 if not exist "%PYTHON%" (
@@ -49,18 +54,11 @@ if "%NO_SSL%"=="1" (
 
 :: ── Step 2: Start Streamlit in background ───────────────────────────────────
 echo [INFO] Starting VidFlow on port %APP_PORT%...
-
-start "VidFlow" /b "%PYTHON%" -m streamlit run app.py ^
-    --server.port %APP_PORT% ^
-    --server.address 0.0.0.0 ^
-    --server.headless true
-
-:: Capture PID of the most recently started background process
-:: (Streamlit starts a uvicorn subprocess; we capture the parent python PID)
-for /f "tokens=2" %%P in ('tasklist /fi "imagename eq python.exe" /fo list ^| findstr "PID:"') do (
-    set "LAST_PID=%%P"
+powershell -NoProfile -Command "$p=Start-Process -FilePath '%PYTHON%' -ArgumentList '-m streamlit run app.py --server.port %APP_PORT% --server.address 0.0.0.0 --server.headless true' -WorkingDirectory '%ROOT%' -WindowStyle Hidden -PassThru; $p.Id | Set-Content -Encoding ascii '%ROOT%vidflow.pid'"
+if %ERRORLEVEL% neq 0 (
+    echo ERROR: Failed to start VidFlow. Check Python and port %APP_PORT%.
+    exit /b 1
 )
-echo !LAST_PID! > vidflow.pid
 
 echo [INFO] VidFlow started.
 echo [INFO] PID written to vidflow.pid — run stop_app.bat to stop.
@@ -74,5 +72,9 @@ if "%NO_SSL%"=="1" (
 echo.
 echo   Internal API server also starts on port %VIDFLOW_INTERNAL_PORT%
 if "%VIDFLOW_INTERNAL_PORT%"=="" echo   (default 8502)
+echo   Browser API URL: %VIDFLOW_INTERNAL_BASE_URL%
+if "%VIDFLOW_INTERNAL_BASE_URL%"=="" echo   (default http://localhost:8502; use a reverse-proxy URL for remote browsers)
+echo   Ollama URL: %OLLAMA_BASE_URL%
+if "%OLLAMA_BASE_URL%"=="" echo   (default http://localhost:11434; use a reachable VM URL in containers)
 echo.
 popd

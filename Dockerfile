@@ -7,7 +7,7 @@
 #   docker run -d --name vidflow \
 #     -p 8501:8501 -p 8502:8502 \
 #     -e NO_SSL=1 \
-#     -e VIDFLOW_INTERNAL_HOST=localhost \
+#     -e VIDFLOW_INTERNAL_BASE_URL=http://localhost:8502 \
 #     -v $(pwd)/screen_recordings:/app/screen_recordings \
 #     your-registry/vidflow:latest
 #
@@ -15,7 +15,7 @@
 #   docker run -d --name vidflow \
 #     -p 8501:8501 -p 8502:8502 \
 #     -e VIDFLOW_DOMAIN=hclswl2learninghub \
-#     -e VIDFLOW_INTERNAL_HOST=hclswl2learninghub \
+#     -e VIDFLOW_INTERNAL_BASE_URL=https://hclswl2learninghub/api \
 #     -v $(pwd)/screen_recordings:/app/screen_recordings \
 #     your-registry/vidflow:latest
 
@@ -42,7 +42,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Copy application code ─────────────────────────────────────────────────────
-COPY app.py video_core.py gen_cert.py ./
+COPY app.py video_core.py ollama_client.py media_import.py gen_cert.py ./
 COPY .streamlit/ ./.streamlit/
 
 # ── Pre-create output directories so volume mounts work correctly ─────────────
@@ -53,12 +53,15 @@ RUN mkdir -p \
         "video+narrated" \
         audio \
         audio_edits \
-        uploads
+        uploads \
+        voice_library \
+        video_webcam_overlay
 
 # ── Expose ports ──────────────────────────────────────────────────────────────
 # 8501 — Streamlit UI
 # 8502 — Internal API server (trim drag-handle + screen recording save)
 EXPOSE 8501 8502
+ENV VIDFLOW_INTERNAL_BIND=0.0.0.0
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 # Use a small entrypoint script so we can:
